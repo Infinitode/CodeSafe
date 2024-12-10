@@ -278,7 +278,7 @@ def decrypt(encrypted_code:str, mapping: dict =_character_map) -> str:
 
     return original_code
 
-def run(encrypted_file: str, mapping: dict = _character_map) -> None:
+def run(encrypted_file: str, mapping: dict = _character_map) -> bool:
     """
     Decrypt and execute the Python code embedded in the specified file.
 
@@ -289,23 +289,28 @@ def run(encrypted_file: str, mapping: dict = _character_map) -> None:
     Returns:
         None
     """
-    # Read the encrypted code from the file
-    with open(encrypted_file, 'r') as file:
-        content = file.read()
+    try:
+        # Read the encrypted code from the file
+        with open(encrypted_file, 'r') as file:
+            content = file.read()
+    
+        # Extract the encrypted code from the comments
+        encrypted_code = re.search(r'# (.+)', content).group(1)
+        encrypted_code = encrypted_code.replace("# ", '')
+    
+        # Decrypt the code
+        decrypted_code = decrypt_code(encrypted_code, mapping)
+    
+        # Execute the decrypted Python code
+        exec(decrypted_code)
+    
+        # I modify the print statement global so this will break for me.
+        #print("Code decrypted and executed successfully.")
+        return true
+except Exception:
+    return false
 
-    # Extract the encrypted code from the comments
-    encrypted_code = re.search(r'# (.+)', content).group(1)
-    encrypted_code = encrypted_code.replace("# ", '')
-
-    # Decrypt the code
-    decrypted_code = decrypt_code(encrypted_code, mapping)
-
-    # Execute the decrypted Python code
-    exec(decrypted_code)
-
-    print("Code decrypted and executed successfully.")
-
-def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _character_map) -> None:
+def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _character_map) -> bool:
     """
     Decrypt the code embedded in the specified file and write it to an output file.
 
@@ -317,19 +322,25 @@ def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _char
     Returns:
         None
     """
-    # Read the encrypted code from the file
-    with open(encrypted_file, 'r') as file:
-        content = file.read()
-
-    # Extract the encrypted code from the comments
-    encrypted_code = re.search(r'# (.+)', content).group(1)
-    encrypted_code = encrypted_code.replace("# ", '')
-
-    # Decrypt the code
-    decrypted_code = decrypt_code(encrypted_code, mapping)
-
-    # Write the decrypted code to the specified output file
-    with open(output_file, 'w') as file:
-        file.write(decrypted_code)
-
-    print(f"Decrypted code written to {output_file}.")
+    try:
+        
+        # Read the encrypted code from the file
+        with open(encrypted_file, 'r') as file:
+            content = file.read()
+    
+        # Extract the encrypted code from the comments
+        encrypted_code = re.search(r'# (.+)', content).group(1)
+        encrypted_code = encrypted_code.replace("# ", '')
+    
+        # Decrypt the code
+        decrypted_code = decrypt_code(encrypted_code, mapping)
+    
+        # Write the decrypted code to the specified output file
+        with open(output_file, 'w') as file:
+            file.write(decrypted_code)
+    
+        # I modify the print global so this will break for me.
+        #print(f"Decrypted code written to {output_file}.")
+        return true
+    except Exception:
+        return false
