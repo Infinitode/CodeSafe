@@ -315,7 +315,7 @@ def decrypt(encrypted_code:str, mapping: dict =_character_map) -> str:
     except Exception as e:
         raise RuntimeError(f"An error occurred during decryption: {e}")
 
-def run(encrypted_file: str, mapping: dict = _character_map) -> bool:
+def run(encrypted_file: str, mapping: dict = _character_map) -> None:
     """
     Decrypt and execute the Python code embedded in the specified file.
 
@@ -343,7 +343,7 @@ def run(encrypted_file: str, mapping: dict = _character_map) -> bool:
     except Exception as e:
         raise RuntimeError(f"An error occurred during decryption and execution: {e}")
 
-def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _character_map) -> bool:
+def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _character_map) -> None:
     """
     Decrypt the code embedded in the specified file and write it to an output file.
 
