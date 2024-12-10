@@ -204,33 +204,54 @@ def encrypt_to_file(code: str, output_file: str, mapping: dict = _character_map)
     Returns:
         None
     """
-    # Step 1: Encrypt using mapping
-    mapped_encrypted = encrypt_with_mapping(code, mapping)
+    try:
+        # Step 1: Encrypt using mapping
+        mapped_encrypted = encrypt_with_mapping(code, mapping)
+        if not mapped_encrypted:
+            raise ValueError("Mapping encryption failed. The result is empty.")
 
-    # Step 2: Caesar Cipher
-    caesar_encrypted = caesar_cipher(mapped_encrypted, SHIFT)
+        # Step 2: Caesar Cipher
+        caesar_encrypted = caesar_cipher(mapped_encrypted, SHIFT)
+        if not caesar_encrypted:
+            raise ValueError("Caesar cipher encryption failed. The result is empty.")
 
-    # Step 3: Base64 Encoding
-    base64_encoded = base64.b64encode(caesar_encrypted.encode()).decode()
+        # Step 3: Base64 Encoding
+        base64_encoded = base64.b64encode(caesar_encrypted.encode()).decode()
+        if not base64_encoded:
+            raise ValueError("Base64 encoding failed. The result is empty.")
 
-    # Write the encrypted code as comments in the Python file
-    with open(output_file, 'w') as file:
-        file.write(f"# {base64_encoded}")
+        try:
+            # Write the encrypted code as comments in the Python file
+            with open(output_file, 'w') as file:
+                file.write(f"# {base64_encoded}")
+        except IOError as e:
+            raise IOError(f"Failed to write to file '{output_file}': {e}")
 
-    print(f"Code encrypted and saved to {output_file}")
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during encryption: {e}")
 
 def decrypt_code(encrypted_code: str, mapping: dict) -> str:
     """Decrypts the encrypted code using the reverse of the encryption methods."""
-    # Step 1: Decode from Base64
-    base64_decoded = base64.b64decode(encrypted_code).decode()
+    try:
+        # Step 1: Decode from Base64
+        base64_decoded = base64.b64decode(encrypted_code).decode()
+        if not base64_decoded:
+            raise ValueError("Base64 decryption failed. The result is empty.")
 
-    # Step 2: Apply the reverse Caesar cipher
-    caesar_decoded = caesar_cipher(base64_decoded, -SHIFT)
+        # Step 2: Apply the reverse Caesar cipher
+        caesar_decoded = caesar_cipher(base64_decoded, -SHIFT)
+        if not caesar_decoded:
+            raise ValueError("Caesar cipher decryption failed. The result is empty.")
 
-    # Step 3: Decrypt using mapping
-    original_code = decrypt_with_mapping(caesar_decoded, mapping)
+        # Step 3: Decrypt using mapping
+        original_code = decrypt_with_mapping(caesar_decoded, mapping)
+        if not original_code:
+            raise ValueError("Mapping decryption failed. The result is empty.")
 
-    return original_code
+        return original_code
+
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during decryption: {e}")
 
 def encrypt(code:str, mapping: dict = _character_map) -> str:
     """
@@ -243,17 +264,25 @@ def encrypt(code:str, mapping: dict = _character_map) -> str:
     Returns:
         str: The encrypted code.
     """
+    try:
+        # Step 1: Encrypt using mapping
+        mapped_encrypted = encrypt_with_mapping(code, mapping)
+        if not mapped_encrypted:
+            raise ValueError("Mapping encryption failed. The result is empty.")
 
-    # Step 1: Encrypt using mapping
-    mapped_encrypted = encrypt_with_mapping(code, mapping)
+        # Step 2: Caesar Cipher
+        caesar_encrypted = caesar_cipher(mapped_encrypted, SHIFT)
+        if not caesar_encrypted:
+            raise ValueError("Caesar cipher encryption failed. The result is empty.")
 
-    # Step 2: Caesar Cipher
-    caesar_encrypted = caesar_cipher(mapped_encrypted, SHIFT)
+        # Step 3: Base64 Encoding
+        base64_encoded = base64.b64encode(caesar_encrypted.encode()).decode()
+        if not base64_encoded:
+            raise ValueError("Base64 encoding failed. The result is empty.")
 
-    # Step 3: Base64 Encoding
-    base64_encoded = base64.b64encode(caesar_encrypted.encode()).decode()
-
-    return base64_encoded
+        return base64_encoded
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during encryption: {e}")
 
 def decrypt(encrypted_code:str, mapping: dict =_character_map) -> str:
     """
@@ -266,17 +295,25 @@ def decrypt(encrypted_code:str, mapping: dict =_character_map) -> str:
     Returns:
         str: The decrypted code.
     """
+    try:
+         # Step 1: Decode from Base64
+        base64_decoded = base64.b64decode(encrypted_code).decode()
+        if not base64_decoded:
+            raise ValueError("Base64 decryption failed. The result is empty.")
 
-    # Step 1: Decode from Base64
-    base64_decoded = base64.b64decode(encrypted_code).decode()
+        # Step 2: Apply the reverse Caesar cipher
+        caesar_decoded = caesar_cipher(base64_decoded, -SHIFT)
+        if not caesar_decoded:
+            raise ValueError("Caesar cipher decryption failed. The result is empty.")
 
-    # Step 2: Apply the reverse Caesar cipher
-    caesar_decoded = caesar_cipher(base64_decoded, -SHIFT)
+        # Step 3: Decrypt using mapping
+        original_code = decrypt_with_mapping(caesar_decoded, mapping)
+        if not original_code:
+            raise ValueError("Mapping decryption failed. The result is empty.")
 
-    # Step 3: Decrypt using mapping
-    original_code = decrypt_with_mapping(caesar_decoded, mapping)
-
-    return original_code
+        return original_code
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during decryption: {e}")
 
 def run(encrypted_file: str, mapping: dict = _character_map) -> bool:
     """
@@ -293,22 +330,18 @@ def run(encrypted_file: str, mapping: dict = _character_map) -> bool:
         # Read the encrypted code from the file
         with open(encrypted_file, 'r') as file:
             content = file.read()
-    
+
         # Extract the encrypted code from the comments
         encrypted_code = re.search(r'# (.+)', content).group(1)
         encrypted_code = encrypted_code.replace("# ", '')
-    
+
         # Decrypt the code
         decrypted_code = decrypt_code(encrypted_code, mapping)
-    
+
         # Execute the decrypted Python code
         exec(decrypted_code)
-    
-        # I modify the print statement global so this will break for me.
-        #print("Code decrypted and executed successfully.")
-        return true
-except Exception:
-    return false
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during decryption and execution: {e}")
 
 def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _character_map) -> bool:
     """
@@ -323,24 +356,38 @@ def decrypt_to_file(encrypted_file: str, output_file: str, mapping: dict = _char
         None
     """
     try:
-        
+        # Check if the mapping is valid
+        if not isinstance(mapping, dict):
+            raise ValueError("The mapping parameter must be a dictionary.")
+
         # Read the encrypted code from the file
-        with open(encrypted_file, 'r') as file:
-            content = file.read()
-    
+        try:
+            with open(encrypted_file, 'r') as file:
+                content = file.read()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"The file {encrypted_file} does not exist.")
+        except IOError as e:
+            raise IOError(f"An error occurred while reading the file {encrypted_file}: {e}")
+
         # Extract the encrypted code from the comments
-        encrypted_code = re.search(r'# (.+)', content).group(1)
-        encrypted_code = encrypted_code.replace("# ", '')
-    
+        match = re.search(r'# (.+)', content)
+        if not match:
+            raise ValueError("No encrypted code found in the file. Ensure the file contains a valid encrypted comment.")
+
+        encrypted_code = match.group(1).replace("# ", '')
+
         # Decrypt the code
-        decrypted_code = decrypt_code(encrypted_code, mapping)
-    
+        try:
+            decrypted_code = decrypt_code(encrypted_code, mapping)
+        except Exception as e:
+            raise ValueError(f"An error occurred during decryption: {e}")
+
         # Write the decrypted code to the specified output file
-        with open(output_file, 'w') as file:
-            file.write(decrypted_code)
-    
-        # I modify the print global so this will break for me.
-        #print(f"Decrypted code written to {output_file}.")
-        return true
-    except Exception:
-        return false
+        try:
+            with open(output_file, 'w') as file:
+                file.write(decrypted_code)
+        except IOError as e:
+            raise IOError(f"An error occurred while writing to the file {output_file}: {e}")
+
+    except Exception as e:
+        print(f"An error occurred during decryption to file: {e}")
