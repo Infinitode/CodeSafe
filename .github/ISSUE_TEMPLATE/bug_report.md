@@ -33,7 +33,7 @@ If applicable, add screenshots to help explain your problem.
  - Dependencies: [e.g. numpy==1.26.4, tensorflow==2.x]
  - Environment (if relevant): [e.g. Docker, virtual environment, or native installation]
 
-**Code snippet (if available):**
+**Relevant Code snippet (if available):**
 ```python
 # Prints out hello world
 print("Hello world")
