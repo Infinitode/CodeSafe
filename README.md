@@ -43,7 +43,7 @@ Please ensure that you have one of these Python versions installed before using 
 > Running encrypted files at runtime using `run()` are only available in formats that can be understood by Python.
 
 > [!IMPORTANT]
-> When running `safe_eval`, make sure to wait for the Python file to finish its bootstrapping phase. This can be done by simple waiting for:
+> When running `safe_eval`, make sure to wait for the Python file to finish its bootstrapping phase. This can be done by simply waiting for:
 > ```python
 > if __name__ == '__main__':
 >    # Run eval, etc.
