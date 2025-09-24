@@ -48,6 +48,24 @@ greet('Johnny')
 
         self.assertEqual(result, 30)
 
+    def test_safe_attribute_access(self):
+        expression = "'hello'.upper()"
+        result = safe_eval(expression, allow_attributes=True)
+        self.assertEqual(result, "HELLO")
+
+    def test_unsafe_attribute_access(self):
+        expression = "().__class__.__bases__[0]"
+        with self.assertRaises(UnsafeExpressionError):
+            safe_eval(expression, allow_attributes=True)
+
+    def test_attribute_access_disabled(self):
+        expression = "'hello'.upper()"
+        with self.assertRaises(UnsafeExpressionError):
+            safe_eval(
+                expression,
+                allow_attributes=False  # Explicitly disable
+            )
+
     def test_security_error_on_unsafe_function(self):
         expression = "os.getcwd()"  # Attempting to call an unsafe function
         try:

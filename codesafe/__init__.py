@@ -1,17 +1,11 @@
 import ast
 import builtins
 from multiprocessing import Process, Queue
+import gc
 import base64
 import re
-import gc
 
 __all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError', 'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file']
-
-def cleanup_resources():
-    """
-    Clean up all open resources by closing them.
-    """
-    gc.collect()  # Force garbage collection
 
 class EvaluationTimeoutError(Exception):
     """Custom exception to handle timeouts during evaluation."""
@@ -34,12 +28,13 @@ def _eval_in_process(expr: str, safe_globals: dict, queue: Queue):
         queue.put(e)
 
 def safe_eval(expr: str,
-              allowed_builtins: dict = None,
-              allowed_vars: dict = None,
+              allowed_builtins: dict = {},
+              allowed_vars: dict = {},
               timeout: float = 5,
-              restricted_imports: list = None,
-              allowed_function_calls: list = None,
-              immediate_termination: bool = False,
+              restricted_imports: list = [],
+              allowed_function_calls: list = [],
+              allow_attributes: bool = False,
+              immediate_termination: bool = True,
               file_access: bool = False,
               network_access: bool = False) -> object:
     """
@@ -52,7 +47,8 @@ def safe_eval(expr: str,
         timeout (float, optional): Time limit for evaluation in seconds. Defaults to 5.
         restricted_imports (list, optional): A list of restricted imports or modules. Defaults to [].
         allowed_function_calls (list, optional): A list of allowed function names to call. Defaults to [].
-        immediate_termination (bool, optional): Whether to forcibly terminate the evaluation if it exceeds the timeout. Defaults to False.
+        allow_attributes (bool, optional): Whether to allow access to safe attributes and methods (e.g., 'str.upper()'). Defaults to False.
+        immediate_termination (bool, optional): Whether to forcibly terminate the evaluation if it exceeds the timeout. Defaults to True.
         file_access (bool, optional): Whether to allow file access (open, etc.). Defaults to False.
         network_access (bool, optional): Whether to allow network access (requests, etc.). Defaults to False.
 
@@ -65,21 +61,16 @@ def safe_eval(expr: str,
         UnsafeExpressionError: If restricted imports or unsafe nodes are detected in the AST.
         SyntaxError: If the expression contains invalid syntax.
     """
-    allowed_builtins = allowed_builtins or {}
-    allowed_vars = allowed_vars or {}
-    restricted_imports = restricted_imports or []
-    allowed_function_calls = allowed_function_calls or []
 
     # Restrict file access by removing file-related functions from built-ins if file_access is False
-    safe_builtins = allowed_builtins.copy()
+    safe_builtins = {k: v for k, v in builtins.__dict__.items()}
+    safe_builtins.update(allowed_builtins)
+
     if not file_access:
         # Remove all file-related functions from built-ins
-        file_access_functions = {'open', 'os.remove', 'os.rename', 'os.rmdir', 'os.unlink',
-                                 'os.mkdir', 'os.makedirs', 'os.chmod', 'os.chown',
-                                 'os.truncate', 'os.path', 'shutil', 'pathlib', 'subprocess'}
-
-        # Filter out functions related to file access
-        safe_builtins = {k: v for k, v in builtins.__dict__.items() if k not in file_access_functions}
+        file_funcs = {'open'}
+        for func in file_funcs:
+            safe_builtins.pop(func, None)
 
     if not network_access:
         # Remove networking-related functions from built-ins
@@ -98,10 +89,9 @@ def safe_eval(expr: str,
     try:
         parsed_expr = ast.parse(expr, mode='eval')
     except SyntaxError as e:
-        cleanup_resources()
         raise SyntaxError(f"Invalid syntax: {e}")
 
-    _check_ast(parsed_expr, restricted_imports, allowed_function_calls)
+    _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_attributes)
 
     queue = Queue()
     process = Process(target=_eval_in_process, args=(expr, safe_globals, queue))
@@ -113,25 +103,25 @@ def safe_eval(expr: str,
         if immediate_termination:
             process.terminate()  # Terminate the process immediately
             process.join()  # Ensure the process has finished
-            cleanup_resources()
+            gc.collect()
             raise EvaluationTimeoutError("Evaluation timed out and was terminated.")
         else:
-            cleanup_resources()
+            gc.collect()
             raise EvaluationTimeoutError("Evaluation timed out.")
 
     # Check for results or exceptions
     if not queue.empty():
         result = queue.get()
         if isinstance(result, Exception):
-            cleanup_resources()
+            gc.collect()
             raise result
     else:
-        cleanup_resources()
+        gc.collect()
         raise EvaluationTimeoutError("No result returned from the evaluation process.")
 
     return result
 
-def _check_ast(parsed_expr, restricted_imports, allowed_function_calls):
+def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_attributes):
     """
     Check the AST for unsafe operations such as imports and function calls.
 
@@ -139,10 +129,14 @@ def _check_ast(parsed_expr, restricted_imports, allowed_function_calls):
         parsed_expr (ast.AST): The parsed AST expression.
         restricted_imports (list): A list of restricted import statements.
         allowed_function_calls (list): A list of allowed function calls.
+        allow_attributes (bool): Whether to allow attribute access.
 
     Raises:
         UnsafeExpressionError: If unsafe operations are detected in the expression.
     """
+    # Attributes starting with '__' are always blocked if attributes are allowed.
+    blocked_attrs = {'__globals__', '__closure__', '__code__', '__subclasses__', '__init__', '__class__', '__bases__'}
+
     for node in ast.walk(parsed_expr):
         # Block all imports if restricted
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -157,8 +151,11 @@ def _check_ast(parsed_expr, restricted_imports, allowed_function_calls):
                 raise UnsafeExpressionError(f"Function call to '{node.func.id}' is not allowed.")
 
         # Prevent attribute access (e.g., accessing os.system or other potentially harmful attributes)
-        if isinstance(node, ast.Attribute):
-            raise UnsafeExpressionError("Attribute access is restricted for security reasons.")
+        if isinstance(node, ast.Attribute) and not allow_attributes:
+            raise UnsafeExpressionError("Attribute access is disabled.")
+        elif isinstance(node, ast.Attribute) and allow_attributes:
+            if node.attr.startswith('__') and node.attr in blocked_attrs:
+                raise UnsafeExpressionError(f"Access to dunder attribute '{node.attr}' is not allowed.")
 
 # Custom key (visible but obfuscated)
 SHIFT = 3  # Caesar cipher shift value
