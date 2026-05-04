@@ -12,6 +12,13 @@ An open-source Python library for code encryption, decryption, and safe evaluati
 > [!NOTE]
 > **CodeSafe** is intended to quickly encrypt/decrypt code files, and run them (only for Python script files) while in their encrypted form, but not as a means for powerful encryption, just code obfuscation. We have also included a `safe_eval` function, that can safely evaluate expressions within a safe environment.
 
+### Changelog v0.0.4:
+- Major performance optimizations for encryption and decryption (~10x speedup).
+- Optimized `safe_eval` by pre-filtering builtins and reducing internal overhead.
+- Added support for `bytes` input in `encrypt`.
+- Added support for file-like stream objects in `run` and `decrypt_to_file`.
+- Standardized error handling (replaced `print` with exceptions).
+
 ### Changelog v0.0.3:
 - Added an `allow_attributes` parameter to `safe_eval` and set `immediate_termination` to be `True` by default for safer function calling.
 
