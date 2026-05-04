@@ -129,6 +129,21 @@ greet('Johnny')
             decrypted_content = f.read()
         self.assertEqual(decrypted_content.strip(), self.python_code.strip())
 
+    def test_bytes_and_streams(self):
+        import io
+        code = b"print('Bytes work')"
+        enc = encrypt(code)
+        self.assertIsInstance(enc, str)
+
+        # Stream run
+        stream = io.StringIO(f"# {enc}")
+        run(stream)
+
+        # Stream decrypt
+        out_stream = io.StringIO()
+        decrypt_to_file(io.StringIO(f"# {enc}"), out_stream)
+        self.assertEqual(out_stream.getvalue(), "print('Bytes work')")
+
     def tearDown(self):
         # Clean up: remove the files created during the tests
         if os.path.exists(self.encrypted_file):
