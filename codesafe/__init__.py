@@ -9,7 +9,41 @@ from typing import Union, Optional, IO
 __all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError', 'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file']
 
 # Pre-filtered builtins to speed up safe_eval
-_BASE_BUILTINS = dict(builtins.__dict__)
+# Only include truly safe builtins - exclude exec, eval, compile, __import__, etc.
+_SAFE_BUILTIN_NAMES = {
+    # Types
+    'int', 'float', 'complex', 'str', 'bytes', 'bytearray', 'list', 'tuple', 
+    'range', 'set', 'frozenset', 'dict', 'bool', 'object',
+    # Functions
+    'abs', 'all', 'any', 'bin', 'chr', 'dir', 'divmod', 'enumerate', 
+    'format', 'hex', 'id', 'isinstance', 'issubclass', 'iter', 'len', 
+    'max', 'min', 'oct', 'ord', 'pow', 'repr', 'reversed', 'round', 
+    'sorted', 'sum', 'type', 'zip',
+    # Exceptions (safe to expose)
+    'Exception', 'BaseException', 'ArithmeticError', 'AssertionError', 
+    'AttributeError', 'BlockingIOError', 'BrokenPipeError', 'BufferError', 
+    'BytesWarning', 'ChildProcessError', 'ConnectionAbortedError', 
+    'ConnectionError', 'ConnectionRefusedError', 'ConnectionResetError', 
+    'DeprecationWarning', 'EOFError', 'EnvironmentError', 'FileExistsError', 
+    'FileNotFoundError', 'FloatingPointError', 'FutureWarning', 
+    'GeneratorExit', 'IOError', 'ImportError', 'ImportWarning', 
+    'IndentationError', 'IndexError', 'InterruptedError', 'IsADirectoryError', 
+    'KeyError', 'KeyboardInterrupt', 'LookupError', 'MemoryError', 
+    'ModuleNotFoundError', 'NameError', 'NotADirectoryError', 
+    'NotImplementedError', 'OSError', 'OverflowError', 
+    'PendingDeprecationWarning', 'PermissionError', 'ProcessLookupError', 
+    'RecursionError', 'ReferenceError', 'ResourceWarning', 'RuntimeError', 
+    'RuntimeWarning', 'StopAsyncIteration', 'StopIteration', 'SyntaxError', 
+    'SyntaxWarning', 'SystemError', 'SystemExit', 'TabError', 'TimeoutError', 
+    'TypeError', 'UnboundLocalError', 'UnicodeDecodeError', 
+    'UnicodeEncodeError', 'UnicodeError', 'UnicodeTranslateError', 
+    'UnicodeWarning', 'UserWarning', 'ValueError', 'Warning', 
+    'ZeroDivisionError',
+    # Constants
+    'True', 'False', 'None',
+}
+
+_BASE_BUILTINS = {name: getattr(builtins, name) for name in _SAFE_BUILTIN_NAMES if hasattr(builtins, name)}
 _FILE_FUNCS = {'open'}
 _NETWORK_FUNCS = {
     'socket', 'requests', 'urllib', 'http.client', 'http.server',
@@ -150,10 +184,24 @@ def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_at
                     raise UnsafeExpressionError(f"Use of '{alias.name}' is restricted.")
             raise UnsafeExpressionError("Imports are not allowed in expressions.")
 
-        # Prevent function calls except for whitelisted ones
+        # Prevent ALL function calls except for whitelisted ones
+        # This includes calls via ast.Name (e.g., exec()), ast.Attribute (e.g., obj.method()),
+        # ast.Subscript (e.g., __builtins__['exec']()), and any other call target
         if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id not in allowed_function_calls:
-                raise UnsafeExpressionError(f"Function call to '{node.func.id}' is not allowed.")
+            # Only allow calls where the function is a simple Name that's in the allowlist
+            # OR a safe builtin function
+            if isinstance(node.func, ast.Name):
+                if node.func.id in allowed_function_calls or node.func.id in _SAFE_BUILTIN_NAMES:
+                    continue  # This call is allowed
+            # Also allow method calls on objects when attributes are allowed
+            # (e.g., 'hello'.upper()) - these are ast.Attribute calls
+            if isinstance(node.func, ast.Attribute) and allow_attributes:
+                # Check it's not a dunder method
+                if node.func.attr.startswith('__') and node.func.attr in blocked_attrs:
+                    raise UnsafeExpressionError(f"Access to dunder attribute '{node.func.attr}' is not allowed.")
+                continue  # Method call is allowed
+            # All other calls are rejected (including subscript, attribute without allow_attributes, lambda, etc.)
+            raise UnsafeExpressionError(f"Function call is not allowed.")
 
         # Prevent attribute access (e.g., accessing os.system or other potentially harmful attributes)
         if isinstance(node, ast.Attribute) and not allow_attributes:
