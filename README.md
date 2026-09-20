@@ -30,6 +30,8 @@ The fix includes:
 2. Using a minimal built-ins allowlist that excludes dangerous functions like `exec`, `eval`, `compile`, and `__import__`
 3. Added comprehensive regression tests for indirect call targets
 
+A huge thanks to [@hkmj19](https://github.com/hkmj19)/[Linkedin](https://www.linkedin.com/in/hemanth-kumar-mj-24b50a256/) for finding and reporting this vulnerability.
+
 ---
 
 ## Vulnerability & Security Testing (`test_poc.py`)
