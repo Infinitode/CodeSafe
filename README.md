@@ -65,7 +65,7 @@ python -m unittest test_poc.py -v
 
 ### Changelog v0.0.5:
 
-* **Security Fix**: Patched critical sandbox escape vulnerability in `safe_eval()` (CVE pending)
+* **Security Fix**: Patched critical sandbox escape vulnerability in `safe_eval()` (CVE pending), thanks to [@hkmj19](https://github.com/hkmj19)/[Linkedin](https://www.linkedin.com/in/hemanth-kumar-mj-24b50a256/) for reporting.
 * Blocked indirect function calls via `ast.Subscript`, `ast.Attribute`, and other non-`ast.Name` targets
 * Implemented minimal safe builtins whitelist excluding `exec`, `eval`, `compile`, `__import__`, and similar dangerous functions
 * Added regression tests for indirect call bypass attempts
