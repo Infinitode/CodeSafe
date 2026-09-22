@@ -7,7 +7,7 @@
 
 An open-source Python library for code encryption, decryption, and safe evaluation using Python's built-in AST module, complete with allowed functions, variables, built-in imports, timeouts, and blocked access to attributes.
 
-*CodeSafe is an experimental library, and we're still running some tests on it. If you encounter any issues, or have an edge use case, please let us know.*
+*CodeSafe is an experimental library, and we're still running some tests on it. If you encounter any issues or have an edge use case, please let us know.*
 
 > [!NOTE]
 > **CodeSafe** is intended to quickly encrypt/decrypt code files, and run them (only for Python script files) while in their encrypted form, but not as a means for powerful encryption, just code obfuscation. We have also included a `safe_eval` function, that can safely evaluate expressions within a safe environment.
@@ -32,11 +32,12 @@ The fix includes:
 
 A huge thanks to [@hkmj19](https://github.com/hkmj19)/[Linkedin](https://www.linkedin.com/in/hemanth-kumar-mj-24b50a256/) for finding and reporting this vulnerability.
 
----
+## Vulnerability & Security Testing ([`test_poc_vulnerability.py`](https://github.com/Infinitode/CodeSafe/blob/main/test_poc_vulnerability.py))
 
-## Vulnerability & Security Testing (`test_poc.py`)
+> [!NOTE]
+> These tests are only available on GitHub, and not on PyPI. They are external tests that aren't built along with `CodeSafe` versions.
 
-CodeSafe v0.0.5+ includes a rigorous test suite (`TestVulnerabilityFixes` and `TestEdgeCases` in `test_poc.py`) to systematically verify that `safe_eval` blocks sandbox escapes while preserving standard evaluation features.
+CodeSafe v0.0.5+ includes a rigorous test suite (`TestVulnerabilityFixes` and `TestEdgeCases` in `test_poc_vulnerability.py`) to systematically verify that `safe_eval` blocks sandbox escapes while preserving standard evaluation features.
 
 ### Test Results Summary
 
@@ -57,11 +58,9 @@ CodeSafe v0.0.5+ includes a rigorous test suite (`TestVulnerabilityFixes` and `T
 To run the security PoC suite locally:
 
 ```bash
-python -m unittest test_poc.py -v
+python -m unittest test_poc_vulnerability.py -v
 
 ```
-
----
 
 ### Changelog v0.0.5:
 
