@@ -10,13 +10,13 @@ An open-source Python library for code encryption, decryption, and safe evaluati
 *CodeSafe is an experimental library, and we're still running some tests on it. If you encounter any issues or have an edge use case, please let us know.*
 
 > [!NOTE]
-> **CodeSafe** is intended to quickly encrypt/decrypt code files, and run them (only for Python script files) while in their encrypted form, but not as a means for powerful encryption, just code obfuscation. We have also included a `safe_eval` function, that can safely evaluate expressions within a safe environment.
+> **CodeSafe** is intended to quickly encrypt/decrypt code files and run them (only for Python script files) while in their encrypted form, but not as a means for powerful encryption, just code obfuscation. We have also included a `safe_eval` function, that can safely evaluate expressions within a safe environment.
 
 ## Security Advisory
 
 ### Critical Vulnerability Fixed in v0.0.5
 
-**Versions 0.0.1 through 0.0.4 contain a known sandbox escape vulnerability in `safe_eval()` that allows arbitrary code execution.**
+**Versions 0.0.1 through 0.0.4 contain a known sandbox escape vulnerability in `safe_eval()` that allows arbitrary code execution.** (CVE ID: CVE-2026-133467)
 
 - **Vulnerability**: The `safe_eval()` function in versions 0.0.1-0.0.4 is vulnerable to a sandbox escape via indirect subscript lookup (e.g., `__builtins__['exec'](...)`). This bypasses the AST validation and allows execution of arbitrary Python code.
 - **Impact**: An attacker controlling an expression passed to `safe_eval()` can execute arbitrary Python code with the application's permissions.
