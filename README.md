@@ -16,7 +16,9 @@ An open-source Python library for code encryption, decryption, and safe evaluati
 
 ### Critical Vulnerability Fixed in v0.0.5
 
-**Versions 0.0.1 through 0.0.4 contain a known sandbox escape vulnerability in `safe_eval()` that allows arbitrary code execution.** (CVE ID: CVE-2026-133467)
+**Versions 0.0.1 through 0.0.4 contain a known sandbox escape vulnerability in `safe_eval()` that allows arbitrary code execution.**
+
+See the security advisory: https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8 (CVE ID: CVE-2026-133467)
 
 - **Vulnerability**: The `safe_eval()` function in versions 0.0.1-0.0.4 is vulnerable to a sandbox escape via indirect subscript lookup (e.g., `__builtins__['exec'](...)`). This bypasses the AST validation and allows execution of arbitrary Python code.
 - **Impact**: An attacker controlling an expression passed to `safe_eval()` can execute arbitrary Python code with the application's permissions.
