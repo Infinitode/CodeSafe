@@ -14,3 +14,4 @@ encrypted_code.encrypt
 decrypted.py
 codesafe_rce_marker.txt
 pathlib_test.txt
+v2_test_prog.encrypt

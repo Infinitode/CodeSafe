@@ -9,6 +9,14 @@ jobs:
   build-n-publish:
     name: Build and publish Python 🐍 distributions 📦 to PyPI
     runs-on: ubuntu-latest
+
+    # Required for PyPI Trusted Publishing (OIDC). No API token or
+    # password is stored in this repository. The token is minted on
+    # demand by GitHub and verified by PyPI against the trusted
+    # publisher configuration for this project.
+    permissions:
+      id-token: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +42,8 @@ jobs:
       - name: Build a binary wheel and source distribution
         run: python -m build
 
+      # Publishes via PyPI Trusted Publishing (OIDC). The distribution
+      # is attested (PEP 740) and the provenance is shown on PyPI under
+      # the "Provenance" information for the release files.
       - name: Publish distribution 📦 to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
