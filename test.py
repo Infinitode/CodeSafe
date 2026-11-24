@@ -68,7 +68,7 @@ greet('Johnny')
 
     def test_security_error_on_unsafe_function(self):
         expression = "os.getcwd()"  # Attempting to call an unsafe function
-        try:
+        with self.assertRaises(UnsafeExpressionError):
             safe_eval(
                 expression,
                 allowed_builtins=self.safe_builtins,
@@ -76,16 +76,13 @@ greet('Johnny')
                 timeout=3,
                 restricted_imports=self.restricted_imports,
                 allowed_function_calls=self.allowed_function_calls
-        )
-        except UnsafeExpressionError:
-            pass
+            )
 
     def test_timeout_error(self):
         expression = "long_running_function()"  # This will run indefinitely
-        # expression = "sleep(5)" # Sleep for 5 seconds
 
         # Check if EvaluationTimeoutError is raised
-        try:
+        with self.assertRaises(EvaluationTimeoutError):
             safe_eval(
                 expression,
                 allowed_builtins=self.safe_builtins,
@@ -95,9 +92,6 @@ greet('Johnny')
                 allowed_function_calls=self.allowed_function_calls,
                 immediate_termination=True
             )
-            self.fail("EvaluationTimeoutError not raised")  # Fail if no exception is raised
-        except EvaluationTimeoutError:
-            pass
 
     def test_encryption(self):
         # Encrypt and save the code to a file
@@ -143,6 +137,41 @@ greet('Johnny')
         out_stream = io.StringIO()
         decrypt_to_file(io.StringIO(f"# {enc}"), out_stream)
         self.assertEqual(out_stream.getvalue(), "print('Bytes work')")
+
+    def test_encrypt_rejects_unmapped_characters(self):
+        # Non-ASCII characters cannot be represented by the 64-char mapping
+        # format, so encrypt() must fail loudly instead of corrupting the output.
+        with self.assertRaises(ValueError):
+            encrypt("print('héllo')")
+        with self.assertRaises(ValueError):
+            encrypt(b"print('\xe2\x9c\x93')")  # UTF-8 for ✓
+
+    def test_encrypt_validates_mapping_values(self):
+        # Every mapping value must be exactly 64 characters (fixed chunk size).
+        with self.assertRaises(ValueError):
+            encrypt("print('hi')", mapping={"p": "too-short"})
+
+    def test_decrypt_rejects_invalid_base64(self):
+        with self.assertRaises(ValueError):
+            decrypt("!!! definitely not base64 !!!")
+
+    def test_exception_propagates_from_evaluation(self):
+        with self.assertRaises(ZeroDivisionError):
+            safe_eval("1/0")
+        with self.assertRaises(NameError):
+            safe_eval("this_name_is_not_defined")
+
+    def test_timeout_must_be_positive(self):
+        for invalid in (0, -1):
+            with self.assertRaises(ValueError):
+                safe_eval("1 + 1", timeout=invalid)
+
+    def test_dir_and_id_are_not_available(self):
+        # Removed from the default safe builtins: pure information leakage.
+        with self.assertRaises(UnsafeExpressionError):
+            safe_eval("dir()")
+        with self.assertRaises(UnsafeExpressionError):
+            safe_eval("id(1)")
 
     def tearDown(self):
         # Clean up: remove the files created during the tests

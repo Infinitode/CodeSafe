@@ -3,3 +3,14 @@ __pycache__
 dist/
 build/
 venv/
+*.egg-info/
+.eggs/
+htmlcov/
+.pytest_cache/
+.coverage
+venv/
+.venv/
+encrypted_code.encrypt
+decrypted.py
+codesafe_rce_marker.txt
+pathlib_test.txt

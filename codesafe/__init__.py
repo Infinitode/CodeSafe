@@ -1,12 +1,17 @@
 import ast
 import builtins
-from multiprocessing import Process, Queue
-import base64
+import pickle
 import re
-import io
+import base64
+from multiprocessing import Process, Queue
+from queue import Empty
 from typing import Union, Optional, IO
 
-__all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError', 'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file']
+__all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError',
+           'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file',
+           '__version__']
+
+__version__ = "0.0.6"
 
 # Pre-filtered builtins to speed up safe_eval
 # Only include truly safe builtins - exclude exec, eval, compile, __import__, etc.
@@ -15,9 +20,9 @@ _SAFE_BUILTIN_NAMES = {
     'int', 'float', 'complex', 'str', 'bytes', 'bytearray', 'list', 'tuple', 
     'range', 'set', 'frozenset', 'dict', 'bool', 'object',
     # Functions
-    'abs', 'all', 'any', 'bin', 'chr', 'dir', 'divmod', 'enumerate', 
-    'format', 'hex', 'id', 'isinstance', 'issubclass', 'iter', 'len', 
-    'max', 'min', 'oct', 'ord', 'pow', 'repr', 'reversed', 'round', 
+    'abs', 'all', 'any', 'bin', 'chr', 'divmod', 'enumerate',
+    'format', 'hex', 'isinstance', 'issubclass', 'iter', 'len',
+    'max', 'min', 'oct', 'ord', 'pow', 'repr', 'reversed', 'round',
     'sorted', 'sum', 'type', 'zip',
     # Exceptions (safe to expose)
     'Exception', 'BaseException', 'ArithmeticError', 'AssertionError', 
@@ -66,9 +71,25 @@ def _eval_in_process(expr: str, safe_globals: dict, queue: Queue):
     """Function to evaluate the expression in a separate process."""
     try:
         result = eval(compile(ast.parse(expr, mode='eval'), "<string>", "eval"), safe_globals)
-        queue.put(result)
-    except Exception as e:
-        queue.put(e)
+    except BaseException as e:
+        result = e
+    # Serialize synchronously in the child. (Putting the object straight on the
+    # queue would defer pickling to the queue's background feeder thread, where
+    # a pickling error can never be reported back to the parent.)
+    try:
+        payload = pickle.dumps(result)
+    except BaseException:
+        if isinstance(result, BaseException):
+            payload = pickle.dumps(RuntimeError(f"Evaluation failed with {type(result).__name__}: {result}"))
+        else:
+            payload = pickle.dumps(RuntimeError(
+                f"The evaluation result of type '{type(result).__name__}' "
+                "cannot be returned because it is not picklable."
+            ))
+    try:
+        queue.put(payload)
+    except Exception:
+        pass
 
 def safe_eval(expr: str,
               allowed_builtins: Optional[dict] = None,
@@ -91,7 +112,7 @@ def safe_eval(expr: str,
         restricted_imports (list, optional): A list of restricted imports or modules.
         allowed_function_calls (list, optional): A list of allowed function names to call.
         allow_attributes (bool, optional): Whether to allow access to safe attributes and methods (e.g., 'str.upper()'). Defaults to False.
-        immediate_termination (bool, optional): Whether to forcibly terminate the evaluation if it exceeds the timeout. Defaults to True.
+        immediate_termination (bool, optional): Deprecated and ignored. The evaluation process is always terminated when the timeout is exceeded, so a runaway expression can never outlive the call. Accepted for backwards compatibility.
         file_access (bool, optional): Whether to allow file access (open, etc.). Defaults to False.
         network_access (bool, optional): Whether to allow network access (requests, etc.). Defaults to False.
 
@@ -100,10 +121,14 @@ def safe_eval(expr: str,
 
     Raises:
         EvaluationTimeoutError: If the evaluation exceeds the allowed time.
-        ValueError: If the expression contains unsafe operations.
+        RuntimeError: If the evaluation produced no result (for example, the result could not be serialized).
         UnsafeExpressionError: If restricted imports or unsafe nodes are detected in the AST.
         SyntaxError: If the expression contains invalid syntax.
+        ValueError: If ``timeout`` is not a positive number.
     """
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        raise ValueError("timeout must be a positive number of seconds.")
+
     allowed_builtins = allowed_builtins or {}
     allowed_vars = allowed_vars or {}
     restricted_imports = restricted_imports or []
@@ -132,33 +157,59 @@ def safe_eval(expr: str,
     try:
         parsed_expr = ast.parse(expr, mode='eval')
     except SyntaxError as e:
-        raise SyntaxError(f"Invalid syntax: {e}")
+        raise SyntaxError(f"Invalid syntax: {e}") from e
 
     _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_attributes)
 
     queue = Queue()
     process = Process(target=_eval_in_process, args=(expr, safe_globals, queue))
 
-    process.start()
-    process.join(timeout)
+    try:
+        process.start()
+        process.join(timeout)
 
-    if process.is_alive():
-        if immediate_termination:
+        if process.is_alive():
+            # Always terminate a runaway child so it can never outlive this call,
+            # regardless of the (deprecated) immediate_termination flag.
             process.terminate()
             process.join()
-            raise EvaluationTimeoutError("Evaluation timed out and was terminated.")
-        else:
-            raise EvaluationTimeoutError("Evaluation timed out.")
+            raise EvaluationTimeoutError(
+                f"Evaluation exceeded the maximum execution timeout of {timeout} seconds and was terminated."
+            )
 
-    # Check for results or exceptions
-    if not queue.empty():
-        result = queue.get()
-        if isinstance(result, Exception):
+        # After join() the child has finished, but the reader thread may still be
+        # draining the pipe, so poll briefly instead of trusting queue.empty(),
+        # which is not reliable.
+        try:
+            payload = queue.get(timeout=1.0)
+        except Empty:
+            raise RuntimeError(
+                "The evaluation process finished without returning a result. "
+                "This usually means the evaluation crashed the child process."
+            ) from None
+
+        try:
+            result = pickle.loads(payload)
+        except Exception as e:
+            raise RuntimeError(f"Failed to deserialize the evaluation result: {e}") from e
+
+        if isinstance(result, BaseException):
             raise result
-    else:
-        raise EvaluationTimeoutError("No result returned from the evaluation process.")
-
-    return result
+        return result
+    finally:
+        try:
+            process.join()
+        except Exception:
+            pass
+        try:
+            process.close()
+        except (ValueError, AttributeError):
+            pass
+        try:
+            queue.close()
+            queue.join_thread()
+        except Exception:
+            pass
 
 def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_attributes):
     """
@@ -173,9 +224,10 @@ def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_at
     Raises:
         UnsafeExpressionError: If unsafe operations are detected in the expression.
     """
-    # Attributes starting with '__' are always blocked if attributes are allowed.
-    blocked_attrs = {'__globals__', '__closure__', '__code__', '__subclasses__', '__init__', '__class__', '__bases__'}
-
+    # Attributes whose names start with '__' (dunders) are always blocked,
+    # whether or not allow_attributes is enabled. A fixed name list is not
+    # enough: dunders can be reached indirectly through string arguments such
+    # as obj.__getattribute__('__class__'), which the AST checker never sees.
     for node in ast.walk(parsed_expr):
         # Block all imports if restricted
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -194,21 +246,24 @@ def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_at
                 if node.func.id in allowed_function_calls or node.func.id in _SAFE_BUILTIN_NAMES:
                     continue  # This call is allowed
             # Also allow method calls on objects when attributes are allowed
-            # (e.g., 'hello'.upper()) - these are ast.Attribute calls
+            # (e.g., 'hello'.upper()) - these are ast.Attribute calls.
+            # Dunder method calls are rejected below by the Attribute check.
             if isinstance(node.func, ast.Attribute) and allow_attributes:
-                # Check it's not a dunder method
-                if node.func.attr.startswith('__') and node.func.attr in blocked_attrs:
+                if node.func.attr.startswith('__'):
                     raise UnsafeExpressionError(f"Access to dunder attribute '{node.func.attr}' is not allowed.")
                 continue  # Method call is allowed
             # All other calls are rejected (including subscript, attribute without allow_attributes, lambda, etc.)
-            raise UnsafeExpressionError(f"Function call is not allowed.")
+            raise UnsafeExpressionError("Function call is not allowed.")
 
-        # Prevent attribute access (e.g., accessing os.system or other potentially harmful attributes)
-        if isinstance(node, ast.Attribute) and not allow_attributes:
-            raise UnsafeExpressionError("Attribute access is disabled.")
-        elif isinstance(node, ast.Attribute) and allow_attributes:
-            if node.attr.startswith('__') and node.attr in blocked_attrs:
+        # Prevent attribute access entirely unless explicitly allowed,
+        # and always block dunder attributes (e.g., __class__, __globals__,
+        # __mro__, __dict__, __getattribute__) since they are the backbone of
+        # every known sandbox escape.
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith('__'):
                 raise UnsafeExpressionError(f"Access to dunder attribute '{node.attr}' is not allowed.")
+            if not allow_attributes:
+                raise UnsafeExpressionError("Attribute access is disabled.")
 
 # Custom key (visible but obfuscated)
 SHIFT = 3  # Caesar cipher shift value
@@ -288,9 +343,45 @@ def encrypt(code: Union[str, bytes], mapping: dict = _character_map) -> str:
 
     Returns:
         str: The encrypted code.
+
+    Raises:
+        ValueError: If the code contains characters that are not present in the
+            encryption mapping (the built-in mapping covers printable ASCII and
+            common whitespace), if a mapping value is not exactly 64 characters,
+            or if decoding ``bytes`` input fails.
+        RuntimeError: If an unexpected error occurs during encryption.
     """
     if isinstance(code, bytes):
-        code = code.decode('utf-8')
+        try:
+            code = code.decode('utf-8')
+        except UnicodeDecodeError as e:
+            raise ValueError(f"The bytes input is not valid UTF-8: {e}") from e
+    if not isinstance(code, str):
+        raise TypeError(f"code must be a str or bytes, not {type(code).__name__}.")
+
+    # The encryption format replaces every input character with exactly
+    # 64 output characters - this is what decrypt's fixed-size chunking
+    # relies on. So every mapping value must be exactly 64 characters long,
+    # and every character in the code must be present in the mapping.
+    # (Previously, characters outside the mapping were passed through
+    # unchanged, which silently corrupted all subsequent output on decrypt.)
+    if not isinstance(mapping, dict):
+        raise TypeError("mapping must be a dictionary.")
+    for key, value in mapping.items():
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(
+                f"The mapping value for {key!r} is {len(value) if isinstance(value, str) else 'not a string'} characters long; "
+                "every mapping value must be exactly 64 characters long."
+            )
+    missing = sorted({c for c in code if c not in mapping})
+    if missing:
+        raise ValueError(
+            f"Code contains characters not present in the encryption mapping: {missing}. "
+            "The built-in mapping covers printable ASCII and common whitespace characters only. "
+            "Escape non-ASCII characters in string literals (e.g. '\\u2713') or remove them from "
+            "comments before encrypting."
+        )
+
     try:
         # Combined step: Mapping + Caesar
         caesar_encrypted = encrypt_with_mapping(code, mapping)
@@ -298,7 +389,7 @@ def encrypt(code: Union[str, bytes], mapping: dict = _character_map) -> str:
             raise ValueError("Encryption failed. The result is empty.")
 
         # Final step: Base64 Encoding
-        base64_encoded = base64.b64encode(caesar_encrypted.encode()).decode()
+        base64_encoded = base64.b64encode(caesar_encrypted.encode('utf-8')).decode('ascii')
         if not base64_encoded:
             raise ValueError("Base64 encoding failed. The result is empty.")
 
@@ -306,7 +397,7 @@ def encrypt(code: Union[str, bytes], mapping: dict = _character_map) -> str:
     except Exception as e:
         if isinstance(e, (ValueError, RuntimeError, TypeError)):
             raise
-        raise RuntimeError(f"An error occurred during encryption: {e}")
+        raise RuntimeError(f"An error occurred during encryption: {e}") from e
 
 def decrypt(encrypted_code: str, mapping: dict = _character_map) -> str:
     """
@@ -320,11 +411,16 @@ def decrypt(encrypted_code: str, mapping: dict = _character_map) -> str:
         str: The decrypted code.
     """
     try:
+        if not isinstance(encrypted_code, str):
+            raise TypeError(f"encrypted_code must be a str, not {type(encrypted_code).__name__}.")
+        # Tolerate incidental whitespace/newlines, but reject any other
+        # characters outside the Base64 alphabet.
+        compact = re.sub(r"\s+", "", encrypted_code)
         # Step 1: Decode from Base64
         try:
-            base64_decoded = base64.b64decode(encrypted_code).decode()
+            base64_decoded = base64.b64decode(compact, validate=True).decode('utf-8')
         except Exception as e:
-            raise ValueError(f"Base64 decryption failed: {e}")
+            raise ValueError(f"Base64 decryption failed: {e}") from e
 
         if not base64_decoded:
             raise ValueError("Base64 decryption failed. The result is empty.")
@@ -336,16 +432,16 @@ def decrypt(encrypted_code: str, mapping: dict = _character_map) -> str:
 
         return original_code
     except Exception as e:
-        if isinstance(e, (ValueError, RuntimeError)):
+        if isinstance(e, (ValueError, RuntimeError, TypeError)):
             raise
-        raise RuntimeError(f"An error occurred during decryption: {e}")
+        raise RuntimeError(f"An error occurred during decryption: {e}") from e
 
-def encrypt_to_file(code: str, output_file: str, mapping: dict = _character_map) -> None:
+def encrypt_to_file(code: Union[str, bytes], output_file: str, mapping: dict = _character_map) -> None:
     """
     Encrypt the given Python code using multiple methods and embed it as comments in a Python file.
 
     Parameters:
-        code (str): The Python code to encrypt.
+        code (str or bytes): The Python code to encrypt.
         output_file (str): The path to the output Python file to embed encrypted code.
         mapping (dict): The mapping dictionary for character replacements.
 
@@ -354,10 +450,10 @@ def encrypt_to_file(code: str, output_file: str, mapping: dict = _character_map)
     """
     encrypted_code = encrypt(code, mapping)
     try:
-        with open(output_file, 'w') as file:
+        with open(output_file, 'w', encoding='utf-8') as file:
             file.write(f"# {encrypted_code}")
-    except IOError as e:
-        raise IOError(f"Failed to write to file '{output_file}': {e}")
+    except OSError as e:
+        raise OSError(f"Failed to write to file '{output_file}': {e}") from e
 
 def decrypt_code(encrypted_code: str, mapping: dict) -> str:
     """Decrypts the encrypted code using the reverse of the encryption methods."""
@@ -366,6 +462,11 @@ def decrypt_code(encrypted_code: str, mapping: dict) -> str:
 def run(encrypted_source: Union[str, IO], mapping: dict = _character_map) -> None:
     """
     Decrypt and execute the Python code embedded in the specified file or stream.
+
+    The decrypted code is executed with ``__name__`` set to ``"__main__"`` in a clean
+    namespace, isolated from CodeSafe's module globals. Note that this is code
+    obfuscation, not a security boundary: the decrypted code runs with the full
+    permissions of the current process.
 
     Parameters:
         encrypted_source (str or stream): Path to the file or a file-like object with embedded encrypted code.
@@ -376,7 +477,7 @@ def run(encrypted_source: Union[str, IO], mapping: dict = _character_map) -> Non
     """
     try:
         if isinstance(encrypted_source, str):
-            with open(encrypted_source, 'r') as file:
+            with open(encrypted_source, 'r', encoding='utf-8') as file:
                 content = file.read()
         else:
             content = encrypted_source.read()
@@ -384,7 +485,7 @@ def run(encrypted_source: Union[str, IO], mapping: dict = _character_map) -> Non
                 content = content.decode('utf-8')
 
         # Extract the encrypted code from the comments
-        match = re.search(r'# ([A-Za-z0-9+/=]+)', content)
+        match = re.search(r'^# ([A-Za-z0-9+/=]+)\s*$', content, re.MULTILINE)
         if not match:
             raise ValueError("No valid encrypted code found in the source.")
 
@@ -392,13 +493,14 @@ def run(encrypted_source: Union[str, IO], mapping: dict = _character_map) -> Non
 
         # Decrypt the code
         decrypted_code = decrypt(encrypted_code, mapping)
-
-        # Execute the decrypted Python code
-        exec(decrypted_code)
     except Exception as e:
-        if isinstance(e, RuntimeError):
+        if isinstance(e, (RuntimeError, ValueError, OSError)):
             raise
-        raise RuntimeError(f"An error occurred during decryption and execution: {e}")
+        raise RuntimeError(f"An error occurred during decryption and execution: {e}") from e
+
+    # Execute the decrypted Python code in a clean namespace that looks like a
+    # script run as __main__, isolated from CodeSafe's own module globals.
+    exec(decrypted_code, {"__name__": "__main__"})
 
 def decrypt_to_file(encrypted_file: Union[str, IO], output_file: Union[str, IO], mapping: dict = _character_map) -> None:
     """
@@ -419,7 +521,7 @@ def decrypt_to_file(encrypted_file: Union[str, IO], output_file: Union[str, IO],
 
         # Read the encrypted code
         if isinstance(encrypted_file, str):
-            with open(encrypted_file, 'r') as file:
+            with open(encrypted_file, 'r', encoding='utf-8') as file:
                 content = file.read()
         else:
             content = encrypted_file.read()
@@ -427,7 +529,7 @@ def decrypt_to_file(encrypted_file: Union[str, IO], output_file: Union[str, IO],
                 content = content.decode('utf-8')
 
         # Extract the encrypted code
-        match = re.search(r'# ([A-Za-z0-9+/=]+)', content)
+        match = re.search(r'^# ([A-Za-z0-9+/=]+)\s*$', content, re.MULTILINE)
         if not match:
             raise ValueError("No encrypted code found in the source.")
 
@@ -438,12 +540,12 @@ def decrypt_to_file(encrypted_file: Union[str, IO], output_file: Union[str, IO],
 
         # Write the decrypted code
         if isinstance(output_file, str):
-            with open(output_file, 'w') as file:
+            with open(output_file, 'w', encoding='utf-8') as file:
                 file.write(decrypted_code)
         else:
             output_file.write(decrypted_code)
 
     except Exception as e:
-        if isinstance(e, (ValueError, RuntimeError, IOError, FileNotFoundError)):
+        if isinstance(e, (ValueError, RuntimeError, OSError)):
             raise
-        raise RuntimeError(f"An error occurred during decryption to file: {e}")
+        raise RuntimeError(f"An error occurred during decryption to file: {e}") from e

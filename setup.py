@@ -1,29 +1,10 @@
-from setuptools import setup, find_packages
+"""Compatibility shim.
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+The canonical project metadata lives in ``pyproject.toml`` (PEP 621).
+This file exists so that legacy tooling that expects a ``setup.py``
+keeps working. The published version is defined in ``pyproject.toml``
+and must match the release tag.
+"""
+from setuptools import setup
 
-setup(
-    name='codesafe',
-    version='{{VERSION_PLACEHOLDER}}',
-    author='Infinitode Pty Ltd',
-    author_email='infinitode.ltd@gmail.com',
-    description="An open-source Python library for code encryption, decryption, and safe evaluation using Python's built-in AST module, complete with allowed functions, variables, built-in imports, timeouts, and blocked access to attributes.",
-    long_description=long_description,
-    long_description_content_type='text/markdown',
-    url='https://github.com/infinitode/codesafe',
-    packages=find_packages(),
-    classifiers=[
-        'Development Status :: 5 - Production/Stable',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
-        'Programming Language :: Python :: 3.12',
-    ],
-    python_requires='>=3.6',
-)
+setup()
