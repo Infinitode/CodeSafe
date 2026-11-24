@@ -8,7 +8,7 @@ Thank you for considering contributing to **CodeSafe**! Contributions, whether t
    Create a fork of this repository to your GitHub account and clone it locally.
 
 2. **Set Up the Environment**  
-   Ensure you have Python 3.6+ installed. You should also install compatible versions of the necessary dependencies for the project.
+   Ensure you have Python 3.8+ installed. You should also install compatible versions of the necessary dependencies for the project.
 
 3. **Run Tests**  
    Before making changes, run tests to confirm that everything works.

@@ -1,12 +1,20 @@
 import ast
 import builtins
-from multiprocessing import Process, Queue
-import base64
+import os
 import re
-import io
+import base64
+import cloudpickle
+from multiprocessing import Process, Queue
+from queue import Empty
 from typing import Union, Optional, IO
 
-__all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError', 'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file']
+from cryptography.fernet import Fernet, InvalidToken
+
+__all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError',
+           'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file',
+           'generate_key', '__version__']
+
+__version__ = "0.0.6"
 
 # Pre-filtered builtins to speed up safe_eval
 # Only include truly safe builtins - exclude exec, eval, compile, __import__, etc.
@@ -15,9 +23,9 @@ _SAFE_BUILTIN_NAMES = {
     'int', 'float', 'complex', 'str', 'bytes', 'bytearray', 'list', 'tuple', 
     'range', 'set', 'frozenset', 'dict', 'bool', 'object',
     # Functions
-    'abs', 'all', 'any', 'bin', 'chr', 'dir', 'divmod', 'enumerate', 
-    'format', 'hex', 'id', 'isinstance', 'issubclass', 'iter', 'len', 
-    'max', 'min', 'oct', 'ord', 'pow', 'repr', 'reversed', 'round', 
+    'abs', 'all', 'any', 'bin', 'chr', 'divmod', 'enumerate',
+    'format', 'hex', 'isinstance', 'issubclass', 'iter', 'len',
+    'max', 'min', 'oct', 'ord', 'pow', 'repr', 'reversed', 'round',
     'sorted', 'sum', 'type', 'zip',
     # Exceptions (safe to expose)
     'Exception', 'BaseException', 'ArithmeticError', 'AssertionError', 
@@ -66,15 +74,30 @@ def _eval_in_process(expr: str, safe_globals: dict, queue: Queue):
     """Function to evaluate the expression in a separate process."""
     try:
         result = eval(compile(ast.parse(expr, mode='eval'), "<string>", "eval"), safe_globals)
-        queue.put(result)
-    except Exception as e:
-        queue.put(e)
+    except BaseException as e:
+        result = e
+    # Serialize synchronously in the child. (Putting the object straight on the
+    # queue would defer pickling to the queue's background feeder thread, where
+    # a pickling error can never be reported back to the parent.)
+    try:
+        payload = cloudpickle.dumps(result)
+    except BaseException:
+        if isinstance(result, BaseException):
+            payload = cloudpickle.dumps(RuntimeError(f"Evaluation failed with {type(result).__name__}: {result}"))
+        else:
+            payload = cloudpickle.dumps(RuntimeError(
+                f"The evaluation result of type '{type(result).__name__}' "
+                "cannot be returned because it cannot be serialized."
+            ))
+    try:
+        queue.put(payload)
+    except Exception:
+        pass
 
 def safe_eval(expr: str,
               allowed_builtins: Optional[dict] = None,
               allowed_vars: Optional[dict] = None,
               timeout: float = 5,
-              restricted_imports: Optional[list] = None,
               allowed_function_calls: Optional[list] = None,
               allow_attributes: bool = False,
               immediate_termination: bool = True,
@@ -88,10 +111,9 @@ def safe_eval(expr: str,
         allowed_builtins (dict, optional): A dictionary of allowed built-in functions.
         allowed_vars (dict, optional): A dictionary of allowed variables and functions.
         timeout (float, optional): Time limit for evaluation in seconds. Defaults to 5.
-        restricted_imports (list, optional): A list of restricted imports or modules.
         allowed_function_calls (list, optional): A list of allowed function names to call.
         allow_attributes (bool, optional): Whether to allow access to safe attributes and methods (e.g., 'str.upper()'). Defaults to False.
-        immediate_termination (bool, optional): Whether to forcibly terminate the evaluation if it exceeds the timeout. Defaults to True.
+        immediate_termination (bool, optional): Deprecated and ignored. The evaluation process is always terminated when the timeout is exceeded, so a runaway expression can never outlive the call. Accepted for backwards compatibility.
         file_access (bool, optional): Whether to allow file access (open, etc.). Defaults to False.
         network_access (bool, optional): Whether to allow network access (requests, etc.). Defaults to False.
 
@@ -100,13 +122,16 @@ def safe_eval(expr: str,
 
     Raises:
         EvaluationTimeoutError: If the evaluation exceeds the allowed time.
-        ValueError: If the expression contains unsafe operations.
+        RuntimeError: If the evaluation produced no result (for example, the result could not be serialized).
         UnsafeExpressionError: If restricted imports or unsafe nodes are detected in the AST.
         SyntaxError: If the expression contains invalid syntax.
+        ValueError: If ``timeout`` is not a positive number.
     """
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        raise ValueError("timeout must be a positive number of seconds.")
+
     allowed_builtins = allowed_builtins or {}
     allowed_vars = allowed_vars or {}
-    restricted_imports = restricted_imports or []
     allowed_function_calls = allowed_function_calls or []
 
     # Optimization: Use pre-filtered builtins base
@@ -132,56 +157,79 @@ def safe_eval(expr: str,
     try:
         parsed_expr = ast.parse(expr, mode='eval')
     except SyntaxError as e:
-        raise SyntaxError(f"Invalid syntax: {e}")
+        raise SyntaxError(f"Invalid syntax: {e}") from e
 
-    _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_attributes)
+    _check_ast(parsed_expr, allowed_function_calls, allow_attributes)
 
     queue = Queue()
     process = Process(target=_eval_in_process, args=(expr, safe_globals, queue))
 
-    process.start()
-    process.join(timeout)
+    try:
+        process.start()
+        process.join(timeout)
 
-    if process.is_alive():
-        if immediate_termination:
+        if process.is_alive():
+            # Always terminate a runaway child so it can never outlive this call,
+            # regardless of the (deprecated) immediate_termination flag.
             process.terminate()
             process.join()
-            raise EvaluationTimeoutError("Evaluation timed out and was terminated.")
-        else:
-            raise EvaluationTimeoutError("Evaluation timed out.")
+            raise EvaluationTimeoutError(
+                f"Evaluation exceeded the maximum execution timeout of {timeout} seconds and was terminated."
+            )
 
-    # Check for results or exceptions
-    if not queue.empty():
-        result = queue.get()
-        if isinstance(result, Exception):
+        # After join() the child has finished, but the reader thread may still be
+        # draining the pipe, so poll briefly instead of trusting queue.empty(),
+        # which is not reliable.
+        try:
+            payload = queue.get(timeout=1.0)
+        except Empty:
+            raise RuntimeError(
+                "The evaluation process finished without returning a result. "
+                "This usually means the evaluation crashed the child process."
+            ) from None
+
+        try:
+            result = cloudpickle.loads(payload)
+        except Exception as e:
+            raise RuntimeError(f"Failed to deserialize the evaluation result: {e}") from e
+
+        if isinstance(result, BaseException):
             raise result
-    else:
-        raise EvaluationTimeoutError("No result returned from the evaluation process.")
+        return result
+    finally:
+        try:
+            process.join()
+        except Exception:
+            pass
+        try:
+            process.close()
+        except (ValueError, AttributeError):
+            pass
+        try:
+            queue.close()
+            queue.join_thread()
+        except Exception:
+            pass
 
-    return result
-
-def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_attributes):
+def _check_ast(parsed_expr, allowed_function_calls, allow_attributes):
     """
     Check the AST for unsafe operations such as imports and function calls.
 
     Parameters:
         parsed_expr (ast.AST): The parsed AST expression.
-        restricted_imports (list): A list of restricted import statements.
         allowed_function_calls (list): A list of allowed function calls.
         allow_attributes (bool): Whether to allow attribute access.
 
     Raises:
         UnsafeExpressionError: If unsafe operations are detected in the expression.
     """
-    # Attributes starting with '__' are always blocked if attributes are allowed.
-    blocked_attrs = {'__globals__', '__closure__', '__code__', '__subclasses__', '__init__', '__class__', '__bases__'}
-
+    # Attributes whose names start with '__' (dunders) are always blocked,
+    # whether or not allow_attributes is enabled. A fixed name list is not
+    # enough: dunders can be reached indirectly through string arguments such
+    # as obj.__getattribute__('__class__'), which the AST checker never sees.
     for node in ast.walk(parsed_expr):
-        # Block all imports if restricted
+        # Imports are never allowed in expressions.
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                if alias.name in restricted_imports:
-                    raise UnsafeExpressionError(f"Use of '{alias.name}' is restricted.")
             raise UnsafeExpressionError("Imports are not allowed in expressions.")
 
         # Prevent ALL function calls except for whitelisted ones
@@ -194,23 +242,115 @@ def _check_ast(parsed_expr, restricted_imports, allowed_function_calls, allow_at
                 if node.func.id in allowed_function_calls or node.func.id in _SAFE_BUILTIN_NAMES:
                     continue  # This call is allowed
             # Also allow method calls on objects when attributes are allowed
-            # (e.g., 'hello'.upper()) - these are ast.Attribute calls
+            # (e.g., 'hello'.upper()) - these are ast.Attribute calls.
+            # Dunder method calls are rejected below by the Attribute check.
             if isinstance(node.func, ast.Attribute) and allow_attributes:
-                # Check it's not a dunder method
-                if node.func.attr.startswith('__') and node.func.attr in blocked_attrs:
+                if node.func.attr.startswith('__'):
                     raise UnsafeExpressionError(f"Access to dunder attribute '{node.func.attr}' is not allowed.")
                 continue  # Method call is allowed
             # All other calls are rejected (including subscript, attribute without allow_attributes, lambda, etc.)
-            raise UnsafeExpressionError(f"Function call is not allowed.")
+            raise UnsafeExpressionError("Function call is not allowed.")
 
-        # Prevent attribute access (e.g., accessing os.system or other potentially harmful attributes)
-        if isinstance(node, ast.Attribute) and not allow_attributes:
-            raise UnsafeExpressionError("Attribute access is disabled.")
-        elif isinstance(node, ast.Attribute) and allow_attributes:
-            if node.attr.startswith('__') and node.attr in blocked_attrs:
+        # Prevent attribute access entirely unless explicitly allowed,
+        # and always block dunder attributes (e.g., __class__, __globals__,
+        # __mro__, __dict__, __getattribute__) since they are the backbone of
+        # every known sandbox escape.
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith('__'):
                 raise UnsafeExpressionError(f"Access to dunder attribute '{node.attr}' is not allowed.")
+            if not allow_attributes:
+                raise UnsafeExpressionError("Attribute access is disabled.")
 
-# Custom key (visible but obfuscated)
+# ---------------------------------------------------------------------------
+# Encryption
+#
+# Since v0.0.6 CodeSafe uses real, authenticated cryptography for new
+# encryptions: Fernet (AES-128-CBC + HMAC-SHA256, from the `cryptography`
+# package) with a 256-bit key. Payloads are UTF-8 safe, so ANY source code,
+# including non-ASCII text, round-trips losslessly.
+#
+# The key is resolved in this order:
+#   1. the ``key`` argument (``generate_key()`` creates a fresh key),
+#   2. the ``CODESAFE_KEY`` environment variable,
+#   3. a built-in default key that ships with the package.
+#
+# The built-in default key is public, so it only protects against casual
+# inspection of the payload - it does NOT protect against someone willing to
+# read CodeSafe's source. For real protection of confidential code, generate
+# your own key and keep it secret.
+#
+# File format written by encrypt_to_file():
+#   # codesafe:v2:<fernet token>
+#
+# Legacy (<= v0.0.5) payloads - Base64-encoded Caesar cipher - are still fully
+# supported by decrypt(), decrypt_to_file() and run() so existing .encrypt
+# files keep working. New encryptions always produce v2 payloads.
+# ---------------------------------------------------------------------------
+_V2_MARKER = "codesafe:v2:"
+_V2_TOKEN_PREFIX = "gAAAAA"  # urlsafe-base64 of Fernet's 0x80 version byte
+
+# Built-in default key. Public knowledge - obfuscation-grade only, see above.
+_CODESAFE_DEFAULT_KEY = b"mp-yFpyWDo-ho-U1mAFboxbNaESEh-NBnEb_mtQ_4q8="
+
+def generate_key() -> str:
+    """
+    Generate a fresh encryption key suitable for use with the ``key`` parameter
+    or the ``CODESAFE_KEY`` environment variable.
+
+    Returns:
+        str: A URL-safe Base64-encoded 256-bit key.
+    """
+    return Fernet.generate_key().decode("ascii")
+
+def _load_key(key):
+    """Resolve the Fernet key: explicit argument > CODESAFE_KEY env > built-in default."""
+    if key is None:
+        env_key = os.environ.get("CODESAFE_KEY")
+        if env_key:
+            key = env_key
+        else:
+            return _CODESAFE_DEFAULT_KEY
+    if isinstance(key, str):
+        try:
+            key = key.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError("The encryption key must be URL-safe Base64 ASCII.") from None
+    if not isinstance(key, bytes):
+        raise TypeError(f"key must be a str, bytes or None, not {type(key).__name__}.")
+    try:
+        Fernet(key)
+    except Exception as e:
+        raise ValueError(f"Invalid encryption key: {e}") from None
+    return key
+
+def _classify_payload(text: str):
+    """Classify an encrypted payload as ``(payload, 'v2' | 'legacy')``."""
+    compact = re.sub(r"\s+", "", text.strip())
+    if compact.startswith("#"):
+        compact = compact[1:]
+    if compact.startswith(_V2_MARKER):
+        return compact[len(_V2_MARKER):], "v2"
+    if compact.startswith(_V2_TOKEN_PREFIX):
+        # Bare v2 token (marker stripped)
+        return compact, "v2"
+    return compact, "legacy"
+
+def _decrypt_v2(token: str, key) -> str:
+    if not token:
+        raise ValueError("Encryption payload is empty.")
+    try:
+        plaintext = Fernet(_load_key(key)).decrypt(token.encode("ascii"))
+    except InvalidToken:
+        raise ValueError(
+            "Decryption failed: the key is wrong, or the data is corrupted or tampered with."
+        ) from None
+    except Exception as e:
+        raise ValueError(f"Decryption failed: {e}") from e
+    return plaintext.decode("utf-8")
+
+# Legacy (<= v0.0.5) obfuscation layer. Retained only so that existing
+# .encrypt files can still be decrypted and executed. New encryptions never
+# use this. Not cryptographically secure - never rely on it for confidentiality.
 SHIFT = 3  # Caesar cipher shift value
 _character_map = {'0': '5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9', '1': '6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b', '2': 'd4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35', '3': '4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce', '4': '4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a', '5': 'ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d', '6': 'e7f6c011776e8db7cd330b54174fd76f7d0216b612387a5ffcfb81e6f0919683', '7': '7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451', '8': '2c624232cdd221771294dfbb310aca000a0df6ac8b66b696d90ef06fdefb64a3', '9': '19581e27de7ced00ff1ce50b2047e7a567c76b1cbaebabe5ef03f7c3017bb5b7', 'a': 'ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb', 'b': '3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d', 'c': '2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6', 'd': '18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4', 'e': '3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea', 'f': '252f10c83610ebca1a059c0bae8255eba2f95be4d1d7bcfa89d7248a82d9f111', 'g': 'cd0aa9856147b6c5b4ff2b7dfee5da20aa38253099ef1b4a64aced233c9afe29', 'h': 'aaa9402664f1a41f40ebbc52c9993eb66aeb366602958fdfaa283b71e64db123', 'i': 'de7d1b721a1e0632b7cf04edf5032c8ecffa9f9a08492152b926f1a5a7e765d7', 'j': '189f40034be7a199f1fa9891668ee3ab6049f82d38c68be70f596eab2e1857b7', 'k': '8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a', 'l': 'acac86c0e609ca906f632b0e2dacccb2b77d22b0621f20ebece1a4835b93f6f0', 'm': '62c66a7a5dd70c3146618063c344e531e6d4b59e379808443ce962b3abd63c5a', 'n': '1b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9', 'o': '65c74c15a686187bb6bbf9958f494fc6b80068034a659a9ad44991b08c58f2d2', 'p': '148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940', 'q': '8e35c2cd3bf6641bdb0e2050b76932cbb2e6034a0ddacc1d9bea82a6ba57f7cf', 'r': '454349e422f05297191ead13e21d3db520e5abef52055e4964b82fb213f593a1', 's': '043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89', 't': 'e3b98a4da31a127d4bde6e43033f66ba274cab0eb7eb1c70ec41402bf6273dd8', 'u': '0bfe935e70c321c7ca3afc75ce0d0ca2f98b5422e008bb31c00c6d7f1f1c0ad6', 'v': '4c94485e0c21ae6c41ce1dfe7b6bfaceea5ab68e40a2476f50208e526f506080', 'w': '50e721e49c013f00c62cf59f2163542a9d8df02464efeb615d31051b0fddc326', 'x': '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881', 'y': 'a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa', 'z': '594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06', 'A': '559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd', 'B': 'df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c', 'C': '6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d', 'D': '3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43', 'E': 'a9f51566bd6705f7ea6ad54bb9deb449f795582d6529a0e22207b8981233ec58', 'F': 'f67ab10ad4e4c53121b6a5fe4da9c10ddee905b978d3788d2723d7bfacbe28a9', 'G': '333e0a1e27815d0ceee55c473fe3dc93d56c63e3bee2b3b4aee8eed6d70191a3', 'H': '44bd7ae60f478fae1061e11a7739f4b94d1daf917982d33b6fc8a01a63f89c21', 'I': 'a83dd0ccbffe39d071cc317ddf6e97f5c6b1c87af91919271f9fa140b0508c6c', 'J': '6da43b944e494e885e69af021f93c6d9331c78aa228084711429160a5bbd15b5', 'K': '86be9a55762d316a3026c2836d044f5fc76e34da10e1b45feee5f18be7edb177', 'L': '72dfcfb0c470ac255cde83fb8fe38de8a128188e03ea5ba5b2a93adbea1062fa', 'M': '08f271887ce94707da822d5263bae19d5519cb3614e0daedc4c7ce5dab7473f1', 'N': '8ce86a6ae65d3692e7305e2c58ac62eebd97d3d943e093f577da25c36988246b', 'O': 'c4694f2e93d5c4e7d51f9c5deb75e6cc8be5e1114178c6a45b6fc2c566a0aa8c', 'P': '5c62e091b8c0565f1bafad0dad5934276143ae2ccef7a5381e8ada5b1a8d26d2', 'Q': '4ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260', 'R': '8c2574892063f995fdf756bce07f46c1a5193e54cd52837ed91e32008ccf41ac', 'S': '8de0b3c47f112c59745f717a626932264c422a7563954872e237b223af4ad643', 'T': 'e632b7095b0bf32c260fa4c539e9fd7b852d0de454e9be26f24d0d6f91d069d3', 'U': 'a25513c7e0f6eaa80a3337ee18081b9e2ed09e00af8531c8f7bb2542764027e7', 'V': 'de5a6f78116eca62d7fc5ce159d23ae6b889b365a1739ad2cf36f925a140d0cc', 'W': 'fcb5f40df9be6bae66c1d77a6c15968866a9e6cbd7314ca432b019d17392f6f4', 'X': '4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015', 'Y': '18f5384d58bcb1bba0bcd9e6a6781d1a6ac2cc280c330ecbab6cb7931b721552', 'Z': 'bbeebd879e1dff6918546dc0c179fdde505f2a21591c9a9c96e36b054ec5af83', '!': 'bb7208bc9b5d7c04f1236a82a0093a5e33f40423d5ba8d4266f7092c3ba43b62', '"': '8a331fdde7032f33a71e1b2e257d80166e348e00fcb17914f48bdb57a1c63007', '#': '334359b90efed75da5f0ada1d5e6b256f4a6bd0aee7eb39c0f90182a021ffc8b', '$': '09fc96082d34c2dfc1295d92073b5ea1dc8ef8da95f14dfded011ffb96d3e54b', '%': 'bbf3f11cb5b43e700273a78d12de55e4a7eab741ed2abf13787a4d2dc832b8ec', '&': '951dcee3a7a4f3aac67ec76a2ce4469cc76df650f134bf2572bf60a65c982338', "'": '265fda17a34611b1533d8a281ff680dc5791b0ce0a11c25b35e11c8e75685509', '(': '32ebb1abcc1c601ceb9c4e3c4faba0caa5b85bb98c4f1e6612c40faa528a91c9', ')': 'ba5ec51d07a4ac0e951608704431d59a02b21a4e951acc10505a8dc407c501ee', '*': '684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1', '+': 'a318c24216defe206feeb73ef5be00033fa9c4a74d0b967f6532a26ca5906d3b', ',': 'd03502c43d74a30b936740a9517dc4ea2b2ad7168caa0a774cefe793ce0b33e7', '-': '3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112', '.': 'cdb4ee2aea69cc6a83331bbe96dc2caa9a299d21329efb0336fc02a82e1839a8', '/': '8a5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f1', ':': 'e7ac0786668e0ff0f02b62bd04f45ff636fd82db63b1104601c975dc005f3a67', ';': '41b805ea7ac014e23556e98bb374702a08344268f92489a02f0880849394a1e4', '<': 'dabd3aff769f07eb2965401eb029974ebba3407afd02b26ddb564ea5f8efae72', '=': '380918b946a526640a40df5dced6516794f3d97bbd9e6bb553d037c4439f31c3', '>': '62b67e1f685b7fef51102005dddd27774be3fee38c42965c53aab035d0b6b221', '?': '8a8de823d5ed3e12746a62ef169bcf372be0ca44f0a1236abc35df05d96928e1', '@': 'c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae', '[': '245843abef9e72e7efac30138a994bf6301e7e1d7d7042a33d42e863d2638811', '\\': 'a9253dc8529dd214e5f22397888e78d3390daa47593e26f68c18f97fd7a3876b', ']': 'cfae0d4248f7142f7b17f826cd7a519280e312577690e957830d23dcf35a3fff', '^': '74cd9ef9c7e15f57bdad73c511462ca65cb674c46c49639c60f1b44650fa1dcb', '_': 'd2e2adf7177b7a8afddbc12d1634cf23ea1a71020f6a1308070a16400fb68fde', '`': '8d33f520a3c4cef80d2453aef81b612bfe1cb44c8b2025630ad38662763f13d3', '{': '021fb596db81e6d02bf3d2586ee3981fe519f275c0ac9ca76bbcf2ebb4097d96', '|': 'cbe5cfdf7c2118a9c3d78ef1d684f3afa089201352886449a06a6511cfef74a7', '}': 'd10b36aa74a59bcf4a88185837f658afaf3646eff2bb16c3928d0e9335e945d2', '~': '7ace431cb61584cb9b8dc7ec08cf38ac0a2d649660be86d349fb43108b542fa4', ' ': '36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068', '\t': '2b4c342f5433ebe591a1da77e013d1b72475562d48578dca8b84bac6651c3cb9', '\n': '01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b', '\r': '9d1e0e2d9459d06523ad13e28a4093c2316baafe7aec5b25f30eba2e113599c4', '\x0b': 'e7cf46a078fed4fafd0b5e3aff144802b853f8ae459a4f0c14add3314b7cc3a6', '\x0c': 'ef6cbd2161eaea7943ce8693b9824d23d1793ffb1c0fca05b600d3899b44c977'}
 
@@ -278,53 +418,64 @@ def reverse_string(text: str) -> str:
     """Reverses the input string."""
     return text[::-1]
 
-def encrypt(code: Union[str, bytes], mapping: dict = _character_map) -> str:
+def encrypt(code: Union[str, bytes], key: Optional[Union[str, bytes]] = None, mapping: Optional[dict] = None) -> str:
     """
-    Encrypt the code using multiple methods and return it.
+    Encrypt the code using authenticated cryptography: Fernet (AES-128-CBC +
+    HMAC-SHA256) with a 256-bit key. Any Unicode source code is supported -
+    the plaintext is UTF-8, so non-ASCII code round-trips losslessly.
 
     Parameters:
         code (str or bytes): The Python code to encrypt.
-        mapping (dict): The mapping dictionary for character replacements.
+        key (str or bytes, optional): URL-safe Base64 256-bit key, as produced by
+            ``generate_key()``. Resolution order: this argument, then the
+            ``CODESAFE_KEY`` environment variable, then a built-in default key
+            (public - obfuscation-grade only).
+        mapping (dict): **Removed.** The Caesar-cipher mapping parameter was removed
+            in v0.0.6. Passing it raises TypeError.
 
     Returns:
-        str: The encrypted code.
+        str: The encrypted payload, prefixed with ``codesafe:v2:``.
+
+    Raises:
+        TypeError: If a legacy ``mapping`` dictionary is passed.
+        ValueError: If ``bytes`` input is not valid UTF-8, or the key is invalid.
     """
+    if mapping is not None or isinstance(key, dict):
+        raise TypeError(
+            "The 'mapping' parameter was removed in CodeSafe v0.0.6. "
+            "Encryption now uses authenticated cryptography (Fernet). "
+            "Use generate_key() to create a key, pass it as key=..., "
+            "or set the CODESAFE_KEY environment variable. "
+            "Old mapping-encrypted content can still be decrypted by passing "
+            "the mapping to decrypt()/decrypt_to_file()/run()."
+        )
     if isinstance(code, bytes):
-        code = code.decode('utf-8')
-    try:
-        # Combined step: Mapping + Caesar
-        caesar_encrypted = encrypt_with_mapping(code, mapping)
-        if not caesar_encrypted:
-            raise ValueError("Encryption failed. The result is empty.")
+        try:
+            code = code.decode('utf-8')
+        except UnicodeDecodeError as e:
+            raise ValueError(f"The bytes input is not valid UTF-8: {e}") from e
+    if not isinstance(code, str):
+        raise TypeError(f"code must be a str or bytes, not {type(code).__name__}.")
 
-        # Final step: Base64 Encoding
-        base64_encoded = base64.b64encode(caesar_encrypted.encode()).decode()
-        if not base64_encoded:
-            raise ValueError("Base64 encoding failed. The result is empty.")
+    token = Fernet(_load_key(key)).encrypt(code.encode('utf-8')).decode('ascii')
+    return _V2_MARKER + token
 
-        return base64_encoded
-    except Exception as e:
-        if isinstance(e, (ValueError, RuntimeError, TypeError)):
-            raise
-        raise RuntimeError(f"An error occurred during encryption: {e}")
-
-def decrypt(encrypted_code: str, mapping: dict = _character_map) -> str:
+def _decrypt_legacy(encrypted_code: str, mapping: dict) -> str:
     """
-    Decrypt the code using multiple methods and return it.
+    Decrypt a pre-0.0.6 Base64 Caesar-cipher payload.
 
-    Parameters:
-        encrypted_code (str): The Python code to decrypt.
-        mapping (dict): The mapping dictionary for character replacements.
-
-    Returns:
-        str: The decrypted code.
+    Kept only so existing .encrypt files keep working. This format is not
+    cryptographically secure - never use it for new encryptions.
     """
     try:
+        # Tolerate incidental whitespace/newlines, but reject any other
+        # characters outside the Base64 alphabet.
+        compact = re.sub(r"\s+", "", encrypted_code)
         # Step 1: Decode from Base64
         try:
-            base64_decoded = base64.b64decode(encrypted_code).decode()
+            base64_decoded = base64.b64decode(compact, validate=True).decode('utf-8')
         except Exception as e:
-            raise ValueError(f"Base64 decryption failed: {e}")
+            raise ValueError(f"Base64 decryption failed: {e}") from e
 
         if not base64_decoded:
             raise ValueError("Base64 decryption failed. The result is empty.")
@@ -336,114 +487,160 @@ def decrypt(encrypted_code: str, mapping: dict = _character_map) -> str:
 
         return original_code
     except Exception as e:
-        if isinstance(e, (ValueError, RuntimeError)):
+        if isinstance(e, (ValueError, RuntimeError, TypeError)):
             raise
-        raise RuntimeError(f"An error occurred during decryption: {e}")
+        raise RuntimeError(f"An error occurred during decryption: {e}") from e
 
-def encrypt_to_file(code: str, output_file: str, mapping: dict = _character_map) -> None:
+def decrypt(encrypted_code: str, key: Optional[Union[str, bytes]] = None, mapping: Optional[dict] = None) -> str:
     """
-    Encrypt the given Python code using multiple methods and embed it as comments in a Python file.
+    Decrypt a payload produced by :func:`encrypt` (v2) or by CodeSafe <= v0.0.5 (legacy).
 
     Parameters:
-        code (str): The Python code to encrypt.
-        output_file (str): The path to the output Python file to embed encrypted code.
-        mapping (dict): The mapping dictionary for character replacements.
+        encrypted_code (str): The payload. May be the string returned by
+            ``encrypt()`` (``codesafe:v2:...``), a bare v2 token, or a full
+            ``# codesafe:v2:...`` comment line such as the one embedded by
+            ``encrypt_to_file()``. Legacy Base64 Caesar payloads are detected
+            automatically.
+        key (str or bytes, optional): Key for v2 payloads. Resolution order:
+            this argument, then the ``CODESAFE_KEY`` environment variable, then
+            the built-in default key.
+        mapping (dict, optional): Legacy Caesar mapping, used only for pre-0.0.6
+            payloads. Defaults to the built-in mapping.
+
+    Returns:
+        str: The decrypted code.
+
+    Raises:
+        ValueError: If the v2 payload cannot be decrypted (wrong key, or the data
+            is corrupted or tampered with), or a legacy payload is malformed.
+        TypeError: If a v2 payload is combined with a ``mapping`` argument.
+    """
+    if isinstance(key, dict):  # Legacy positional call: decrypt(payload, legacy_mapping)
+        mapping = key
+        key = None
+    if not isinstance(encrypted_code, str):
+        raise TypeError(f"encrypted_code must be a str, not {type(encrypted_code).__name__}.")
+
+    payload, kind = _classify_payload(encrypted_code)
+    if kind == "v2":
+        if mapping is not None:
+            raise TypeError(
+                "The 'mapping' parameter only applies to legacy (pre-0.0.6) encrypted "
+                "content. For v2 content, pass key=... (or set CODESAFE_KEY) instead."
+            )
+        return _decrypt_v2(payload, key)
+    return _decrypt_legacy(payload, mapping if mapping is not None else _character_map)
+
+def encrypt_to_file(code: Union[str, bytes], output_file: str, key: Optional[Union[str, bytes]] = None, mapping: Optional[dict] = None) -> None:
+    """
+    Encrypt the given Python code with authenticated cryptography and embed it
+    as a comment in a Python file.
+
+    The output file contains a single line of the form ``# codesafe:v2:<token>``,
+    which can be executed with :func:`run` and decrypted with :func:`decrypt_to_file`.
+
+    Parameters:
+        code (str or bytes): The Python code to encrypt.
+        output_file (str): Path of the output Python file to write.
+        key (str or bytes, optional): Key for encryption. See :func:`encrypt`.
+        mapping (dict): **Removed.** Passing it raises TypeError.
 
     Returns:
         None
     """
-    encrypted_code = encrypt(code, mapping)
+    encrypted_code = encrypt(code, key=key, mapping=mapping)
     try:
-        with open(output_file, 'w') as file:
+        with open(output_file, 'w', encoding='utf-8') as file:
             file.write(f"# {encrypted_code}")
-    except IOError as e:
-        raise IOError(f"Failed to write to file '{output_file}': {e}")
+    except OSError as e:
+        raise OSError(f"Failed to write to file '{output_file}': {e}") from e
 
-def decrypt_code(encrypted_code: str, mapping: dict) -> str:
-    """Decrypts the encrypted code using the reverse of the encryption methods."""
-    return decrypt(encrypted_code, mapping)
+def decrypt_code(encrypted_code: str, mapping: Optional[dict] = None, key: Optional[Union[str, bytes]] = None) -> str:
+    """Decrypt an encrypted payload. Alias of :func:`decrypt` kept for backwards compatibility."""
+    return decrypt(encrypted_code, key=key, mapping=mapping)
 
-def run(encrypted_source: Union[str, IO], mapping: dict = _character_map) -> None:
+def _extract_payload(content: str) -> str:
+    """Extract the encrypted payload from a file's content (v2 comment, or legacy comment)."""
+    match = re.search(r'^# (codesafe:v2:[A-Za-z0-9_-]+={0,2})\s*$', content, re.MULTILINE)
+    if match:
+        return match.group(1)
+    match = re.search(r'^# ([A-Za-z0-9+/=]+)\s*$', content, re.MULTILINE)
+    if match:
+        return match.group(1)
+    raise ValueError("No encrypted code found in the source.")
+
+def _read_source(source) -> str:
+    if isinstance(source, str):
+        with open(source, 'r', encoding='utf-8') as file:
+            return file.read()
+    content = source.read()
+    if isinstance(content, bytes):
+        content = content.decode('utf-8')
+    return content
+
+def run(encrypted_source: Union[str, IO], key: Optional[Union[str, bytes]] = None, mapping: Optional[dict] = None) -> None:
     """
     Decrypt and execute the Python code embedded in the specified file or stream.
 
+    The decrypted code is executed with ``__name__`` set to ``"__main__"`` in a
+    clean namespace, isolated from CodeSafe's module globals. Encryption
+    protects the code at rest and on disk; the decrypted code still runs with
+    the full permissions of the current process, so only run code you trust.
+
     Parameters:
-        encrypted_source (str or stream): Path to the file or a file-like object with embedded encrypted code.
-        mapping (dict): The mapping dictionary for character replacements.
+        encrypted_source (str or stream): Path to the file, or a file-like object
+            with embedded encrypted code.
+        key (str or bytes, optional): Key for v2 payloads. Defaults to
+            ``CODESAFE_KEY`` or the built-in default key. A legacy positional
+            argument in the ``key`` slot receives a dict and is treated as the
+            legacy Caesar ``mapping``.
+        mapping (dict, optional): Legacy Caesar mapping for pre-0.0.6 payloads.
 
     Returns:
         None
     """
     try:
-        if isinstance(encrypted_source, str):
-            with open(encrypted_source, 'r') as file:
-                content = file.read()
-        else:
-            content = encrypted_source.read()
-            if isinstance(content, bytes):
-                content = content.decode('utf-8')
-
-        # Extract the encrypted code from the comments
-        match = re.search(r'# ([A-Za-z0-9+/=]+)', content)
-        if not match:
-            raise ValueError("No valid encrypted code found in the source.")
-
-        encrypted_code = match.group(1)
-
-        # Decrypt the code
-        decrypted_code = decrypt(encrypted_code, mapping)
-
-        # Execute the decrypted Python code
-        exec(decrypted_code)
+        content = _read_source(encrypted_source)
+        payload = _extract_payload(content)
+        decrypted_code = decrypt(payload, key=key, mapping=mapping)
     except Exception as e:
-        if isinstance(e, RuntimeError):
+        if isinstance(e, (RuntimeError, ValueError, OSError, TypeError)):
             raise
-        raise RuntimeError(f"An error occurred during decryption and execution: {e}")
+        raise RuntimeError(f"An error occurred during decryption and execution: {e}") from e
 
-def decrypt_to_file(encrypted_file: Union[str, IO], output_file: Union[str, IO], mapping: dict = _character_map) -> None:
+    # Execute the decrypted Python code in a clean namespace that looks like a
+    # script run as __main__, isolated from CodeSafe's own module globals.
+    exec(decrypted_code, {"__name__": "__main__"})
+
+def decrypt_to_file(encrypted_file: Union[str, IO], output_file: Union[str, IO], key: Optional[Union[str, bytes]] = None, mapping: Optional[dict] = None) -> None:
     """
     Decrypt the code embedded in the specified file/stream and write it to an output file/stream.
 
     Parameters:
         encrypted_file (str or stream): Path to the source or a file-like object.
         output_file (str or stream): Path to the destination or a file-like object.
-        mapping (dict): The mapping dictionary for character replacements.
+        key (str or bytes, optional): Key for v2 payloads (see :func:`encrypt`).
+        mapping (dict, optional): Legacy Caesar mapping for pre-0.0.6 payloads.
 
     Returns:
         None
     """
     try:
-        # Check if the mapping is valid
-        if not isinstance(mapping, dict):
+        if mapping is not None and not isinstance(mapping, dict):
             raise ValueError("The mapping parameter must be a dictionary.")
 
-        # Read the encrypted code
-        if isinstance(encrypted_file, str):
-            with open(encrypted_file, 'r') as file:
-                content = file.read()
-        else:
-            content = encrypted_file.read()
-            if isinstance(content, bytes):
-                content = content.decode('utf-8')
-
-        # Extract the encrypted code
-        match = re.search(r'# ([A-Za-z0-9+/=]+)', content)
-        if not match:
-            raise ValueError("No encrypted code found in the source.")
-
-        encrypted_code = match.group(1)
-
-        # Decrypt the code
-        decrypted_code = decrypt(encrypted_code, mapping)
+        content = _read_source(encrypted_file)
+        payload = _extract_payload(content)
+        decrypted_code = decrypt(payload, key=key, mapping=mapping)
 
         # Write the decrypted code
         if isinstance(output_file, str):
-            with open(output_file, 'w') as file:
+            with open(output_file, 'w', encoding='utf-8') as file:
                 file.write(decrypted_code)
         else:
             output_file.write(decrypted_code)
 
     except Exception as e:
-        if isinstance(e, (ValueError, RuntimeError, IOError, FileNotFoundError)):
+        if isinstance(e, (ValueError, RuntimeError, OSError, TypeError)):
             raise
-        raise RuntimeError(f"An error occurred during decryption to file: {e}")
+        raise RuntimeError(f"An error occurred during decryption to file: {e}") from e

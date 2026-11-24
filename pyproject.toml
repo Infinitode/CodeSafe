@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codesafe"
+version = "0.0.6"
+description = "An open-source Python library for code encryption, decryption, and safe evaluation using Python's built-in AST module, complete with allowed functions, variables, built-in imports, timeouts, and blocked access to attributes."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Infinitode Pty Ltd", email = "infinitode.ltd@gmail.com"},
+]
+keywords = ["eval", "safe-eval", "sandbox", "encryption", "security", "ast", "cryptography"]
+dependencies = [
+    "cryptography>=41",
+    "cloudpickle>=2.2",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/infinitode/codesafe"
+Repository = "https://github.com/infinitode/codesafe"
+Issues = "https://github.com/infinitode/codesafe/issues"
+
+[tool.setuptools]
+packages = ["codesafe"]
