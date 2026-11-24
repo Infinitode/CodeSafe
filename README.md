@@ -22,7 +22,7 @@ An open-source Python library for code encryption, decryption, and safe evaluati
 | Advisory | CVE / GHSA | Affected | Fixed in |
 | :--- | :--- | :--- | :--- |
 | `safe_eval` sandbox escape via indirect subscript call | CVE-2026-133467 · [GHSA-7gp8-3j6q-v4h8](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) | 0.0.1 - 0.0.4 | 0.0.5 |
-| `safe_eval` sandbox escape via dunder attribute access with `allow_attributes=True` (string-argument indirection, e.g. `().__getattribute__('__class__')`) | Pending assignment | 0.0.3 - 0.0.5 | **0.0.6** |
+| `safe_eval` sandbox escape via dunder attribute access with `allow_attributes=True` (string-argument indirection, e.g. `().__getattribute__('__class__')`) | [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) · CVE pending | 0.0.3 - 0.0.5 | **0.0.6** |
 
 You can browse all advisories at https://github.com/Infinitode/CodeSafe/security/advisories
 
@@ -35,7 +35,7 @@ You can browse all advisories at https://github.com/Infinitode/CodeSafe/security
 - **Affected versions**: 0.0.3, 0.0.4, 0.0.5
 - **Fixed in**: Version **0.0.6** - all attribute names starting with `__` are now always rejected.
 - **Workaround for older versions**: leave `allow_attributes` at its default (`False`). There is no complete workaround otherwise - upgrade.
-- **Advisory**: a GitHub Security Advisory is being prepared for this issue and will be published together with v0.0.6, at which point a CVE ID will be requested and assigned. Track it under [GitHub Security Advisories](https://github.com/Infinitode/CodeSafe/security/advisories).
+- **Advisory**: [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) (High, 8.1). Fixed in v0.0.6, which is live on PyPI. A CVE ID will be requested from and assigned by GitHub when the advisory is published; see the advisory for the CVE once it has been assigned.
 
 ### Critical Vulnerability Fixed in v0.0.5
 

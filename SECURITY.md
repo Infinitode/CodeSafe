@@ -33,7 +33,7 @@ We ask that you give us reasonable time to release a fix before any public discl
 | Version | Supported |
 | :--- | :--- |
 | 0.0.6 and later | ✅ Yes |
-| 0.0.5 | ⚠️ Known issue — see [Security Advisory](README.md#security-advisory); upgrade to 0.0.6 |
+| 0.0.5 | ⚠️ Known issue — see [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q); upgrade to 0.0.6 |
 | 0.0.1 – 0.0.4 | ❌ No — critical sandbox escape, [CVE-2026-133467](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) |
 
 Only the latest release receives fixes. Please upgrade rather than report issues that may already be fixed.
@@ -43,7 +43,7 @@ Only the latest release receives fixes. Please upgrade rather than report issues
 | Advisory | CVE / GHSA | Affected | Fixed in |
 | :--- | :--- | :--- | :--- |
 | `safe_eval` sandbox escape via indirect subscript call | CVE-2026-133467 · [GHSA-7gp8-3j6q-v4h8](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) | 0.0.1 - 0.0.4 | 0.0.5 |
-| `safe_eval` sandbox escape via dunder attribute string-argument (`allow_attributes=True`) | Pending assignment (draft advisory) | 0.0.3 - 0.0.5 | 0.0.6 |
+| `safe_eval` sandbox escape via dunder attribute string-argument (`allow_attributes=True`) | [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) · CVE pending | 0.0.3 - 0.0.5 | 0.0.6 |
 
 See https://github.com/Infinitode/CodeSafe/security/advisories for the canonical list.
 
