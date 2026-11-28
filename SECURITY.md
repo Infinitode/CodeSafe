@@ -32,8 +32,9 @@ We ask that you give us reasonable time to release a fix before any public discl
 
 | Version | Supported |
 | :--- | :--- |
-| 0.0.6 and later | ✅ Yes |
-| 0.0.5 | ⚠️ Known issue — see [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q); upgrade to 0.0.6 |
+| 0.0.7 and later | ✅ Yes |
+| 0.0.6 | ⚠️ Known critical issue — the `safe_eval()` result is deserialized in the caller (remote code execution); fixed in 0.0.7 |
+| 0.0.5 | ⚠️ Known issue — see [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q); upgrade to 0.0.7 |
 | 0.0.1 – 0.0.4 | ❌ No — critical sandbox escape, [CVE-2026-133467](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) |
 
 Only the latest release receives fixes. Please upgrade rather than report issues that may already be fixed.
@@ -44,6 +45,7 @@ Only the latest release receives fixes. Please upgrade rather than report issues
 | :--- | :--- | :--- | :--- |
 | `safe_eval` sandbox escape via indirect subscript call | CVE-2026-133467 · [GHSA-7gp8-3j6q-v4h8](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) | 0.0.1 - 0.0.4 | 0.0.5 |
 | `safe_eval` sandbox escape via dunder attribute string-argument (`allow_attributes=True`) | [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) · CVE pending | 0.0.3 - 0.0.5 | 0.0.6 |
+| Remote code execution in the calling process via unsafe deserialization of the `safe_eval()` result | GHSA to be assigned · CVE pending | 0.0.6 | 0.0.7 |
 
 See https://github.com/Infinitode/CodeSafe/security/advisories for the canonical list.
 
@@ -51,7 +53,7 @@ See https://github.com/Infinitode/CodeSafe/security/advisories for the canonical
 
 CodeSafe contains two very different components, and reports are welcome for both, but keep in mind:
 
-- **`safe_eval()`** is a best-effort sandbox, not a hard security boundary. Reports demonstrating escapes under documented usage are very much in scope. Reports that require you to defeat host-level isolation (containers, seccomp, etc.) are out of scope.
+- **`safe_eval()`** is a best-effort sandbox, not a hard security boundary. Reports demonstrating escapes under documented usage are very much in scope. Reports that require you to defeat host-level isolation (containers, seccomp, etc.) are out of scope. Since 0.0.7 the evaluation result is data-only and never deserialized with pickle, so "the result object's `__reduce__` runs in the caller" is no longer reachable; being unable to return lambdas/classes is a documented limitation, not a vulnerability.
 - **Encryption** protects code at rest. The built-in default key is public by design; only payloads encrypted with a user-supplied key can be confidential (see [Security Limitations & Notes](README.md#security-limitations--notes)). Reports of integrity/confidentiality failures in the v2 format (wrong key accepted, tampered payload decrypting successfully) are in scope; "the default key is public" is by design, not a vulnerability.
 
 Thank you for helping make CodeSafe safer!

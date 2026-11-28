@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codesafe"
-version = "0.0.6"
+version = "0.0.7"
 description = "An open-source Python library for code encryption, decryption, and safe evaluation using Python's built-in AST module, complete with allowed functions, variables, built-in imports, timeouts, and blocked access to attributes."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -15,7 +15,6 @@ authors = [
 keywords = ["eval", "safe-eval", "sandbox", "encryption", "security", "ast", "cryptography"]
 dependencies = [
     "cryptography>=41",
-    "cloudpickle>=2.2",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
