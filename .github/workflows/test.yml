@@ -42,21 +42,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=41"
 
-      - name: Diagnostics
-        if: always()
-        run: python diag_test.py
-
       - name: Run test suite
-        run: |
-          set +e
-          python -m unittest test.py test_poc_vulnerability.py -v 2>&1 | tee /tmp/suite.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            # Surface failures as annotations so they are readable even when
-            # runner logs are unavailable.
-            grep -E "^(FAIL|ERROR):" /tmp/suite.log | while IFS= read -r line; do
-              echo "::error title=Test failure::$line"
-            done
-            grep -E -A 25 "^(FAIL|ERROR):" /tmp/suite.log | head -150
-          fi
-          exit "$status"
+        # Plain `python -m unittest` in every shell: the previous version piped
+        # through tee with POSIX syntax, which the Windows runners execute with
+        # PowerShell, so the Windows job failed on the shell rather than on a
+        # test. Runners print full output on failure, so no log scraping is
+        # needed here.
+        run: python -m unittest test.py test_poc_vulnerability.py -v

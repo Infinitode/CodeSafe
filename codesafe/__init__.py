@@ -167,6 +167,55 @@ def safe_eval(expr: str,
         )
 
 
+# Maximum bracket ()[]{} nesting depth accepted before parsing. Legitimate
+# expressions never approach this; the limit exists so that hostile input is
+# rejected by a cheap scan instead of crashing the C parser, whose behaviour on
+# deep nesting differs between CPython versions (3.8 raises MemoryError).
+_MAX_EXPRESSION_NESTING = 64
+
+_OPENING = {"(": ")", "[": "]", "{": "}"}
+_CLOSING = {")", "]", "}"}
+
+
+def _reject_excessive_nesting(expr, limit=_MAX_EXPRESSION_NESTING):
+    """Raise UnsafeExpressionError if brackets nest deeper than ``limit``.
+
+    String literals are skipped so brackets inside them do not count. This is
+    deliberately a simple lexical scan: it runs before the real parser and only
+    needs to be conservative about very deep input, not exact about Python's
+    full grammar.
+    """
+    if not isinstance(expr, str):
+        return  # parser will produce its own error for non-str input
+    depth = 0
+    max_depth = 0
+    quote = None
+    escaped = False
+    for ch in expr:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in _OPENING:
+            depth += 1
+            if depth > max_depth:
+                max_depth = depth
+                if max_depth > limit:
+                    raise UnsafeExpressionError(
+                        f"Expression nesting exceeds the maximum depth of {limit}."
+                    )
+        elif ch in _CLOSING:
+            if depth > 0:
+                depth -= 1
+    return None
+
+
 def _safe_eval_impl(expr, allowed_builtins, allowed_vars, timeout,
                     allowed_function_calls, allow_attributes, file_access,
                     network_access, allow_objects):
@@ -175,10 +224,21 @@ def _safe_eval_impl(expr, allowed_builtins, allowed_vars, timeout,
     allowed_vars = allowed_vars or {}
     allowed_function_calls = allowed_function_calls or []
 
+    _reject_excessive_nesting(expr)
+
     try:
         parsed_expr = ast.parse(expr, mode='eval')
     except SyntaxError as e:
         raise SyntaxError(f"Invalid syntax: {e}") from e
+    except (MemoryError, RecursionError) as e:
+        # Deeply nested input can overflow the C parser's stack instead of a
+        # tidy SyntaxError; CPython 3.8 in particular raises MemoryError from
+        # compile() here ("s_push: parser stack overflow"). Treat it as a
+        # rejected expression rather than letting it escape as an unrelated
+        # MemoryError from inside the library.
+        raise UnsafeExpressionError(
+            "Expression is too deeply nested to evaluate safely."
+        ) from e
 
     _check_ast(parsed_expr, allowed_function_calls, allow_attributes,
                allowed_builtins=allowed_builtins, allowed_vars=allowed_vars)
