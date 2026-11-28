@@ -47,4 +47,16 @@ jobs:
         run: python diag_test.py
 
       - name: Run test suite
-        run: python -m unittest test.py test_poc_vulnerability.py -v
+        run: |
+          set +e
+          python -m unittest test.py test_poc_vulnerability.py -v 2>&1 | tee /tmp/suite.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # Surface failures as annotations so they are readable even when
+            # runner logs are unavailable.
+            grep -E "^(FAIL|ERROR):" /tmp/suite.log | while IFS= read -r line; do
+              echo "::error title=Test failure::$line"
+            done
+            grep -E -A 25 "^(FAIL|ERROR):" /tmp/suite.log | head -150
+          fi
+          exit "$status"
