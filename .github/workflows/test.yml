@@ -42,5 +42,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=41"
 
+      - name: Diagnostics
+        if: always()
+        run: python diag_test.py
+
       - name: Run test suite
         run: python -m unittest test.py test_poc_vulnerability.py -v
