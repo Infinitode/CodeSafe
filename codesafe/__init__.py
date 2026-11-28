@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import threading
+import multiprocessing
 import base64
 from multiprocessing import Process, Pipe
 from typing import Union, Optional, IO
@@ -137,6 +138,16 @@ def safe_eval(expr: str,
         RuntimeError: If the evaluation produced no result, or the result is not
             plain data (for example a lambda, a generator, a module or a
             user-defined object).
+
+    .. warning::
+       On platforms without ``fork`` (Windows), or when the host application
+       has pinned the ``spawn`` start method, ``multiprocessing`` pickles the
+       process arguments - including everything in ``allowed_vars`` and
+       ``allowed_builtins`` - inside the calling process before the child
+       starts. Only pass trusted objects in those dictionaries, as you would
+       with any pickle-based API. Where ``fork`` is available and the host has
+       not pinned a start method, CodeSafe selects ``fork`` precisely so that
+       nothing supplied by the caller is pickled.
         UnsafeExpressionError: If restricted imports or unsafe nodes are detected in the AST.
         SyntaxError: If the expression contains invalid syntax.
         ValueError: If ``timeout`` is not a positive number.
@@ -195,8 +206,25 @@ def _safe_eval_impl(expr, allowed_builtins, allowed_vars, timeout,
     if allowed_vars:
         safe_globals.update(allowed_vars)
 
-    parent_conn, child_conn = Pipe(duplex=False)
-    process = Process(target=_eval_in_process, args=(expr, safe_globals, child_conn))
+    # On the 'spawn' start method (the default on Windows and macOS) starting a
+    # process pickles the whole Process object, arguments included, *in the
+    # caller*. Everything passed through allowed_vars/allowed_builtins would be
+    # reduced with pickle in the parent - a deserialization sink in the caller,
+    # before any sandbox exists. Where the platform supports it, use fork so the
+    # child inherits these objects and nothing is pickled on the way in. When
+    # the host application has chosen a start method explicitly we respect it,
+    # and spawn's cost is documented in the README.
+    context = multiprocessing.get_context()
+    if context.get_start_method() == 'spawn' and \
+            multiprocessing.get_start_method(allow_none=True) is None:
+        try:
+            multiprocessing.set_start_method('fork')
+            context = multiprocessing.get_context()
+        except (ValueError, RuntimeError):
+            pass  # platform has no fork; stay on spawn
+
+    parent_conn, child_conn = context.Pipe(duplex=False)
+    process = context.Process(target=_eval_in_process, args=(expr, safe_globals, child_conn))
 
     # Read in a background thread: the child blocks once the OS pipe buffer is
     # full, so the parent must keep draining while it waits. (A large result
@@ -408,9 +436,13 @@ def _encode_result(value):
         if name == 'fractions.Fraction':
             # Copy the integer parts; str(Fraction) would format them as a
             # ratio string and is subject to the digit limit like any other
-            # int-to-str conversion.
-            numerator = int.__int__(obj.numerator)
-            denominator = int.__int__(obj.denominator)
+            # int-to-str conversion. (int.__int__ only exists on 3.11+, so go
+            # through int() and verify the exact type rather than calling a
+            # version-dependent slot wrapper.)
+            numerator = int(obj.numerator)
+            denominator = int(obj.denominator)
+            if type(numerator) is not int or type(denominator) is not int:
+                return ('unserializable', name)
             return ('frac', (str(numerator), str(denominator)))
 
         if cls is list:
