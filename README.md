@@ -33,7 +33,7 @@ You can browse all advisories at https://github.com/Infinitode/CodeSafe/security
 
 - **Vulnerability**: The AST checker only guarded what ran inside the evaluation subprocess. The child serialized whatever the expression produced with `cloudpickle.dumps()`, and the parent called `cloudpickle.loads()` on it with full builtins. An expression could return an object whose `__reduce__` chain ran arbitrary code *the moment the parent unpickled it* - the injected code executed in the caller's process, not the sandbox, and the default configuration was enough.
 - **Impact**: An attacker who controls only the expression passed to `safe_eval()` obtained arbitrary code execution in the host application, with the host's privileges (CVSS 3.1: 9.8, `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`). This is a distinct root cause from CVE-2026-133467: the sandbox itself worked; the boundary back to the caller did not.
-- **Affected versions**: 0.0.6 (0.0.1-0.0.5 were not affected by this specific issue, since they returned results through `multiprocessing.Queue` without a parent-side `cloudpickle.loads()`; they were affected by the earlier advisories instead)
+- **Affected versions**: 0.0.6 only. Versions 0.0.1-0.0.5 are not affected by this specific bug: they return results through a `multiprocessing.Queue` with the standard library's `pickle`, and this gadget cannot survive that encoder (`Can't pickle local object`). Those versions are affected by the earlier advisories instead. Note that 0.0.5's `Queue.get()` does unpickle in the parent, so the underlying pattern is similar, but no working payload of this kind was found for 0.0.5.
 - **Fixed in**: Version **0.0.7**. The result boundary no longer involves pickle at all: the child encodes only plain data (see below) and the parent reconstructs it from primitives. A returned value has no code path into the caller.
 - **Workaround for 0.0.6**: none that is complete - treat every expression as fully trusted, or upgrade.
 - **Related hardening in the same release**: `str.format`/`format_map` templates that name attributes or keys (`'{0.__class__}'.format(obj)`) are rejected; rebinding a safe-builtin name (`(len := f)()`, `[f() for len in [..]]`, `(lambda len: len())(f)`) no longer lets an expression call a non-allowlisted callable; callables passed to builtins that invoke them (`sorted(key=...)`, `iter(f, None)`) follow the same allowlist; `__builtins__` is not reachable by name; `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` raised by an expression arrive as a catchable `RuntimeError` instead of killing or unwinding the caller; and `file_access=False` can no longer be bypassed by re-introducing `open` through `allowed_builtins`.
@@ -62,7 +62,7 @@ See the security advisory: https://github.com/Infinitode/CodeSafe/security/advis
 - **Affected Versions**: 0.0.1, 0.0.2, 0.0.3, 0.0.4
 - **Fixed In**: Version 0.0.5 and later
 
-**If you are using any version from 0.0.1 to 0.0.4, you should upgrade to version 0.0.6 or later immediately.** These earlier versions should **not** be used in untrusted expression evaluation environments.
+**If you are using any version from 0.0.1 to 0.0.4, you should upgrade to version 0.0.7 or later immediately.** These earlier versions should **not** be used in untrusted expression evaluation environments.
 
 The fix includes:
 1. Rejecting all `ast.Call` nodes unless the exact target is explicitly whitelisted (including calls via subscript, attribute, and other indirect targets)
@@ -150,7 +150,7 @@ python -m unittest test.py test_poc_vulnerability.py -v
 ### Changelog v0.0.5:
 
 > [!WARNING]
-> **v0.0.5 (and earlier) has a second, known sandbox-escape issue**, fixed in v0.0.6: with `allow_attributes=True`, dunder attributes could be read through string arguments (e.g. `().__getattribute__('__class__')`), bypassing the dunder blocklist. See the [Security Advisory](#security-advisory) section. **If you use `allow_attributes=True` on 0.0.5 or earlier, upgrade to v0.0.6 now.**
+> **v0.0.5 (and earlier) has a second, known sandbox-escape issue**, fixed in v0.0.6: with `allow_attributes=True`, dunder attributes could be read through string arguments (e.g. `().__getattribute__('__class__')`), bypassing the dunder blocklist. See the [Security Advisory](#security-advisory) section. **If you use `allow_attributes=True` on 0.0.5 or earlier, upgrade to v0.0.7 now.**
 
 * **Security Fix**: Patched critical sandbox escape vulnerability in `safe_eval()` (CVE-2026-133467), thanks to [@hkmj19](https://github.com/hkmj19)/[Linkedin](https://www.linkedin.com/in/hemanth-kumar-mj-24b50a256/) for reporting.
 * Blocked indirect function calls via `ast.Subscript`, `ast.Attribute`, and other non-`ast.Name` targets
