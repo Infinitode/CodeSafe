@@ -48,4 +48,4 @@ jobs:
         # PowerShell, so the Windows job failed on the shell rather than on a
         # test. Runners print full output on failure, so no log scraping is
         # needed here.
-        run: python -m unittest test.py test_poc_vulnerability.py -v
+        run: python run_ci_tests.py
