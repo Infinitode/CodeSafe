@@ -1,11 +1,12 @@
 import ast
 import builtins
+import contextlib
 import os
 import re
+import sys
+import threading
 import base64
-import cloudpickle
-from multiprocessing import Process, Queue
-from queue import Empty
+from multiprocessing import Process, Pipe
 from typing import Union, Optional, IO
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -14,7 +15,7 @@ __all__ = ['safe_eval', 'EvaluationTimeoutError', 'UnsafeExpressionError',
            'encrypt_to_file', 'encrypt', 'decrypt', 'run', 'decrypt_to_file',
            'generate_key', '__version__']
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 # Pre-filtered builtins to speed up safe_eval
 # Only include truly safe builtins - exclude exec, eval, compile, __import__, etc.
@@ -70,29 +71,28 @@ class UnsafeExpressionError(Exception):
         self.message = f"UnsafeExpressionError: An unsafe evaluation expression was detected. Reason: {error}"
         super().__init__(self.message)
 
-def _eval_in_process(expr: str, safe_globals: dict, queue: Queue):
-    """Function to evaluate the expression in a separate process."""
+# Upper bound on int<->str conversions. Applied only for the duration of a
+# safe_eval() call, so the host's own settings are restored afterwards.
+_SAFE_INT_MAX_STR_DIGITS = 10_000
+
+
+@contextlib.contextmanager
+def _digit_limit(limit):
+    """Temporarily cap int<->str conversion size (Python 3.11+; no-op before)."""
+    if not hasattr(sys, "set_int_max_str_digits"):
+        yield
+        return
+    original = sys.get_int_max_str_digits()
     try:
-        result = eval(compile(ast.parse(expr, mode='eval'), "<string>", "eval"), safe_globals)
-    except BaseException as e:
-        result = e
-    # Serialize synchronously in the child. (Putting the object straight on the
-    # queue would defer pickling to the queue's background feeder thread, where
-    # a pickling error can never be reported back to the parent.)
+        sys.set_int_max_str_digits(limit)
+    except ValueError:
+        yield
+        return
     try:
-        payload = cloudpickle.dumps(result)
-    except BaseException:
-        if isinstance(result, BaseException):
-            payload = cloudpickle.dumps(RuntimeError(f"Evaluation failed with {type(result).__name__}: {result}"))
-        else:
-            payload = cloudpickle.dumps(RuntimeError(
-                f"The evaluation result of type '{type(result).__name__}' "
-                "cannot be returned because it cannot be serialized."
-            ))
-    try:
-        queue.put(payload)
-    except Exception:
-        pass
+        yield
+    finally:
+        sys.set_int_max_str_digits(original)
+
 
 def safe_eval(expr: str,
               allowed_builtins: Optional[dict] = None,
@@ -102,7 +102,8 @@ def safe_eval(expr: str,
               allow_attributes: bool = False,
               immediate_termination: bool = True,
               file_access: bool = False,
-              network_access: bool = False) -> object:
+              network_access: bool = False,
+              allow_objects: bool = False) -> object:
     """
     Safely evaluate a Python expression with limited access to built-ins, custom variables, and optional file access restriction.
 
@@ -116,13 +117,26 @@ def safe_eval(expr: str,
         immediate_termination (bool, optional): Deprecated and ignored. The evaluation process is always terminated when the timeout is exceeded, so a runaway expression can never outlive the call. Accepted for backwards compatibility.
         file_access (bool, optional): Whether to allow file access (open, etc.). Defaults to False.
         network_access (bool, optional): Whether to allow network access (requests, etc.). Defaults to False.
+        allow_objects (bool, optional): Whether the result may be a container
+            (list/tuple/dict/set) of plain data. Defaults to False, in which case
+            only a single plain value (None, bool, int, float, complex, str,
+            bytes, Decimal, Fraction) can be returned and a container raises
+            ``RuntimeError``. This keeps the default surface minimal; set it to
+            ``True`` if your expressions legitimately return collections.
 
     Returns:
-        object: The result of the evaluated expression.
+        object: The result of the evaluated expression. Results are restricted to
+            plain data - see ``allow_objects``. The outcome travels from the
+            evaluation subprocess as plain primitives and is never deserialized
+            with pickle/cloudpickle, so a returned value cannot execute code in
+            the calling process. Lambdas, classes and instances of user-defined
+            types are not returned; they raise ``RuntimeError``.
 
     Raises:
         EvaluationTimeoutError: If the evaluation exceeds the allowed time.
-        RuntimeError: If the evaluation produced no result (for example, the result could not be serialized).
+        RuntimeError: If the evaluation produced no result, or the result is not
+            plain data (for example a lambda, a generator, a module or a
+            user-defined object).
         UnsafeExpressionError: If restricted imports or unsafe nodes are detected in the AST.
         SyntaxError: If the expression contains invalid syntax.
         ValueError: If ``timeout`` is not a positive number.
@@ -130,12 +144,42 @@ def safe_eval(expr: str,
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
         raise ValueError("timeout must be a positive number of seconds.")
 
+    # An expression can build arbitrarily large integers in a few operations
+    # (e.g. ``10 ** 10 ** 8``). The child enforces a timeout, but constructing
+    # or converting such an int can burn CPU in the parent afterwards, so the
+    # limit is tightened for the duration of this call (Python 3.11+).
+    with _digit_limit(_SAFE_INT_MAX_STR_DIGITS):
+        return _safe_eval_impl(
+            expr, allowed_builtins, allowed_vars, timeout,
+            allowed_function_calls, allow_attributes, file_access,
+            network_access, allow_objects,
+        )
+
+
+def _safe_eval_impl(expr, allowed_builtins, allowed_vars, timeout,
+                    allowed_function_calls, allow_attributes, file_access,
+                    network_access, allow_objects):
+    """Body of :func:`safe_eval` (run under the int-digit limit)."""
     allowed_builtins = allowed_builtins or {}
     allowed_vars = allowed_vars or {}
     allowed_function_calls = allowed_function_calls or []
 
+    try:
+        parsed_expr = ast.parse(expr, mode='eval')
+    except SyntaxError as e:
+        raise SyntaxError(f"Invalid syntax: {e}") from e
+
+    _check_ast(parsed_expr, allowed_function_calls, allow_attributes,
+               allowed_builtins=allowed_builtins, allowed_vars=allowed_vars)
+
     # Optimization: Use pre-filtered builtins base
     safe_builtins = _BASE_BUILTINS.copy()
+
+    # Caller-supplied builtins are merged BEFORE the feature flags are applied,
+    # so file_access=False cannot be bypassed by passing ``open`` through
+    # ``allowed_builtins``.
+    if allowed_builtins:
+        safe_builtins.update(allowed_builtins)
 
     if not file_access:
         for func in _FILE_FUNCS:
@@ -145,73 +189,448 @@ def safe_eval(expr: str,
         for func in _NETWORK_FUNCS:
             safe_builtins.pop(func, None)
 
-    if allowed_builtins:
-        safe_builtins.update(allowed_builtins)
-
-    # Set up the globals for eval
+    # Set up the globals for eval. ``__builtins__`` cannot be named by the
+    # expression: the AST checker rejects it.
     safe_globals = {"__builtins__": safe_builtins}
     if allowed_vars:
         safe_globals.update(allowed_vars)
 
-    # Pre-evaluation AST checks
-    try:
-        parsed_expr = ast.parse(expr, mode='eval')
-    except SyntaxError as e:
-        raise SyntaxError(f"Invalid syntax: {e}") from e
+    parent_conn, child_conn = Pipe(duplex=False)
+    process = Process(target=_eval_in_process, args=(expr, safe_globals, child_conn))
 
-    _check_ast(parsed_expr, allowed_function_calls, allow_attributes)
+    # Read in a background thread: the child blocks once the OS pipe buffer is
+    # full, so the parent must keep draining while it waits. (A large result
+    # can exceed the buffer; a synchronous recv() would deadlock against it.)
+    received = []
+    finished = threading.Event()
 
-    queue = Queue()
-    process = Process(target=_eval_in_process, args=(expr, safe_globals, queue))
+    def _reader():
+        try:
+            received.append(parent_conn.recv())
+        except (EOFError, OSError):
+            pass
+        finally:
+            finished.set()
+
+    reader = threading.Thread(target=_reader, name="codesafe-eval-reader", daemon=True)
 
     try:
         process.start()
-        process.join(timeout)
+        child_conn.close()  # parent must not hold the write end open
+        reader.start()
+        finished.wait(timeout)
 
+        if not finished.is_set():
+            # Give the child a brief grace period to finish, then terminate any
+            # runaway process so it can never outlive this call, regardless of
+            # the (deprecated) immediate_termination flag.
+            finished.wait(0.2)
+            if not finished.is_set() or process.is_alive():
+                process.terminate()
+                process.join()
+                raise EvaluationTimeoutError(
+                    f"Evaluation exceeded the maximum execution timeout of {timeout} seconds and was terminated."
+                )
+
+        process.join(0.2)
         if process.is_alive():
-            # Always terminate a runaway child so it can never outlive this call,
-            # regardless of the (deprecated) immediate_termination flag.
+            # The child produced its result but has not exited (for example it
+            # spawned a thread); it can no longer affect us, so reap it.
             process.terminate()
             process.join()
-            raise EvaluationTimeoutError(
-                f"Evaluation exceeded the maximum execution timeout of {timeout} seconds and was terminated."
-            )
 
-        # After join() the child has finished, but the reader thread may still be
-        # draining the pipe, so poll briefly instead of trusting queue.empty(),
-        # which is not reliable.
-        try:
-            payload = queue.get(timeout=1.0)
-        except Empty:
+        outcome = received[0] if received else None
+        if outcome is None:
             raise RuntimeError(
                 "The evaluation process finished without returning a result. "
                 "This usually means the evaluation crashed the child process."
-            ) from None
+            )
 
-        try:
-            result = cloudpickle.loads(payload)
-        except Exception as e:
-            raise RuntimeError(f"Failed to deserialize the evaluation result: {e}") from e
+        if not isinstance(outcome, (tuple, list)) or len(outcome) != 5:
+            raise RuntimeError("Failed to deserialize the evaluation result: malformed outcome.")
 
-        if isinstance(result, BaseException):
-            raise result
+        kind, payload, error_name, error_message, error_attrs = outcome
+        if kind not in _RESULT_KINDS:
+            raise RuntimeError(f"Failed to deserialize the evaluation result: unknown kind {kind!r}")
+
+        if kind == 'error':
+            raise _rebuild_error(error_name, error_message, error_attrs)
+        if kind == 'unserializable':
+            raise RuntimeError(
+                f"The evaluation result of type '{payload}' cannot be returned. "
+                "Only plain data (None, bool, int, float, complex, str, bytes, "
+                "Decimal, Fraction) is returned from safe_eval - lambdas, classes, "
+                "instances of user-defined types, modules and generators are not."
+            )
+        if kind == 'depth_exceeded':
+            raise RuntimeError(
+                f"The evaluation result is nested more than {_MAX_DEPTH} levels deep "
+                "and cannot be returned."
+            )
+        if kind == 'too_large':
+            raise RuntimeError("The evaluation result is too large to be returned.")
+
+        result_kind, result_payload = payload
+        result = _decode_result((result_kind, result_payload))
+        if isinstance(result, (list, tuple, dict, set, frozenset)) and not allow_objects:
+            raise RuntimeError(
+                "The evaluation returned a container (list, tuple, dict, set). "
+                "Returning containers across the process boundary is opt-in: pass "
+                "allow_objects=True to receive them, or select a single plain value "
+                "from the container (e.g. ``[...][0]``)."
+            )
         return result
     finally:
+        finished.wait(0.5)  # let the reader finish before the fd disappears
         try:
-            process.join()
+            parent_conn.close()
+        except Exception:
+            pass
+        try:
+            process.join(0)
         except Exception:
             pass
         try:
             process.close()
         except (ValueError, AttributeError):
             pass
+
+
+# Exceptions that must never escape into the caller: they do not derive from
+# Exception, so ``except Exception`` would not catch them, and SystemExit would
+# terminate the host process. They are reported as RuntimeError instead.
+_CONTROL_FLOW_EXCEPTIONS = frozenset({'SystemExit', 'KeyboardInterrupt', 'GeneratorExit'})
+
+
+def _rebuild_error(name, message, attrs):
+    """Recreate an exception raised by the child from plain, vetted parts."""
+    exc_type = getattr(builtins, name, None)
+    if name in _CONTROL_FLOW_EXCEPTIONS or not _is_stdlib_error_type(exc_type):
+        exc_type = RuntimeError
+    try:
+        exc = exc_type(message)
+    except Exception:
+        exc = RuntimeError(message)
+    try:
+        for attr_name, attr_value in (attrs or ()):
+            if attr_name in _ERROR_ATTRS:
+                setattr(exc, attr_name, attr_value)
+    except Exception:
+        pass
+    return exc
+
+
+# ---------------------------------------------------------------------------
+# Safe-eval result channel
+#
+# The child process evaluates the expression and reports its outcome over a
+# multiprocessing.Pipe as a self-describing, fixed-shape structure: the kind of
+# outcome plus an already-encoded, primitive payload.  The parent NEVER
+# deserializes objects it receives - there is no pickle/cloudpickle on the
+# boundary at all, so a value produced by the expression has no way to run code
+# in the parent.  (Up to v0.0.6 the child sent a cloudpickle blob and the parent
+# called cloudpickle.loads() on it, which let an expression smuggle a
+# __reduce__ gadget into the caller's process.)
+#
+# Accepted results are deliberately limited to plain data:
+#   * None, True/False, int, float, complex, str, bytes
+#   * decimal.Decimal and fractions.Fraction (returned as Decimal/Fraction)
+#   * ... optionally nested, but only inside list, tuple, dict and set/frozenset
+#
+# Anything else - lambdas, classes, instances of user-defined types, modules,
+# generators, file objects - raises a clear RuntimeError instead of being
+# serialized.  This closes the parent-side deserialization sink completely:
+# there is nothing left for a malicious result to hook into.
+# ---------------------------------------------------------------------------
+_MAX_DEPTH = 100
+_MAX_RESULT_NODES = 1_000_000
+_MAX_RESULT_BYTES = 1 * 1024 * 1024  # total size of returned str/bytes data
+_ATOMIC_TYPES = (type(None), bool, int, float, complex, str, bytes)
+
+_RESULT_KINDS = frozenset({
+    'value', 'error', 'unserializable', 'depth_exceeded', 'too_large',
+})
+
+# Exception attributes that are safe to carry across the boundary for the
+# exceptions CodeSafe itself produces (timeouts, blocked expressions).
+_ERROR_ATTRS = ('message',)
+
+
+def _is_stdlib_error_type(exc_type) -> bool:
+    """True if exc_type is a plain builtin exception (no user code attached)."""
+    return (
+        isinstance(exc_type, type)
+        and issubclass(exc_type, BaseException)
+        and exc_type.__module__ == 'builtins'
+        and getattr(builtins, exc_type.__name__, None) is exc_type
+    )
+
+
+def _encode_result(value):
+    """Encode an evaluation result into plain, JSON-compatible primitives.
+
+    Returns ``(kind, payload)`` where ``kind`` is one of ``_RESULT_KINDS``.
+    The encoder walks the object graph directly; it never calls ``pickle``,
+    ``__reduce__`` or any other serialization hook on the objects it sees.
+    """
+    budget = [_MAX_RESULT_NODES, _MAX_RESULT_BYTES]  # nodes, bytes
+
+    def enc(obj, depth):
+        if depth > _MAX_DEPTH:
+            return ('depth_exceeded', None)
+        if budget[0] <= 0:
+            return ('too_large', None)
+        budget[0] -= 1
+
+        cls = type(obj)
+        if cls in _ATOMIC_TYPES or obj is None:
+            if cls is int:
+                return ('i', str(obj))
+            if cls is float:
+                # float.hex() is exact and also round-trips NaN/inf.
+                return ('f', obj.hex())
+            if cls is complex:
+                return ('c', str(obj))
+            if cls in (str, bytes):
+                budget[1] -= len(obj)
+                if budget[1] < 0:
+                    return ('too_large', None)
+            return (cls.__name__, obj)
+
+        # Ordered check: subclasses of the atomic types are NOT accepted; only
+        # the exact builtin types above are. This keeps the decoder simple and
+        # immune to str/int subclasses carrying overridden behaviour.
+        name = cls.__module__ + '.' + cls.__qualname__
+        # Leaf nodes are returned without the (kind, value) wrapper used for
+        # containers below.
+        if name == 'decimal.Decimal':
+            return ('dec', str(obj))
+        if name == 'fractions.Fraction':
+            # Copy the integer parts; str(Fraction) would format them as a
+            # ratio string and is subject to the digit limit like any other
+            # int-to-str conversion.
+            numerator = int.__int__(obj.numerator)
+            denominator = int.__int__(obj.denominator)
+            return ('frac', (str(numerator), str(denominator)))
+
+        if cls is list:
+            items = []
+            for item in obj:
+                kind, payload = enc(item, depth + 1)
+                if kind in ('depth_exceeded', 'too_large'):
+                    return (kind, None)
+                if kind == 'unserializable':
+                    return ('unserializable', payload + ' (inside a list)')
+                items.append((kind, payload))
+            return ('list', items)
+        if cls is tuple:
+            items = []
+            for item in obj:
+                kind, payload = enc(item, depth + 1)
+                if kind in ('depth_exceeded', 'too_large'):
+                    return (kind, None)
+                if kind == 'unserializable':
+                    return ('unserializable', payload + ' (inside a tuple)')
+                items.append((kind, payload))
+            return ('tuple', items)
+        if cls is set or cls is frozenset:
+            items = []
+            label = 'frozenset' if cls is frozenset else 'set'
+            for item in obj:
+                kind, payload = enc(item, depth + 1)
+                if kind in ('depth_exceeded', 'too_large'):
+                    return (kind, None)
+                if kind == 'unserializable':
+                    return ('unserializable', payload + f' (inside a {label})')
+                items.append((kind, payload))
+            return (label, items)
+        if cls is dict:
+            items = []
+            for key, val in obj.items():
+                kk, kp = enc(key, depth + 1)
+                if kk in ('depth_exceeded', 'too_large'):
+                    return (kk, None)
+                if kk == 'unserializable':
+                    return ('unserializable', kp + ' (as a dict key)')
+                vk, vp = enc(val, depth + 1)
+                if vk in ('depth_exceeded', 'too_large'):
+                    return (vk, None)
+                if vk == 'unserializable':
+                    return ('unserializable', vp + ' (inside a dict)')
+                items.append((kk, kp, vk, vp))
+            return ('dict', items)
+
+        return ('unserializable', cls.__module__ + '.' + cls.__qualname__)
+
+    try:
+        kind, payload = enc(value, 0)
+    except BaseException as exc:  # a hostile container can raise from iteration
+        return ('unserializable', f'<{type(exc).__name__} while encoding the result>')
+    if kind in ('unserializable', 'depth_exceeded', 'too_large'):
+        return (kind, payload)
+    return ('value', (kind, payload))
+
+
+def _decode_result(payload):
+    """Rebuild a plain-data result from an encoded, primitive payload.
+
+    Only the primitives produced by :func:`_encode_result` are constructed -
+    no class lookup, no imports, no dynamic code.
+    """
+    def dec(kind, data):
+        if kind == 'NoneType':
+            return None
+        if kind == 'bool':
+            return bool(data)
+        if kind == 'i':
+            return int(data)
+        if kind == 'f':
+            return float.fromhex(data)
+        if kind == 'c':
+            return complex(data)
+        if kind == 'str':
+            return str(data)
+        if kind == 'bytes':
+            return bytes(data)
+        if kind == 'dec':
+            import decimal
+            return decimal.Decimal(data)
+        if kind == 'frac':
+            import fractions
+            return fractions.Fraction(int(data[0]), int(data[1]))
+        if kind == 'list':
+            return [dec(k, v) for k, v in data]
+        if kind == 'tuple':
+            return tuple(dec(k, v) for k, v in data)
+        if kind == 'set':
+            return {dec(k, v) for k, v in data}
+        if kind == 'frozenset':
+            return frozenset(dec(k, v) for k, v in data)
+        if kind == 'dict':
+            return {dec(kk, kp): dec(vk, vp) for kk, kp, vk, vp in data}
+        raise RuntimeError(f'Failed to deserialize the evaluation result: unknown kind {kind!r}')
+
+    return dec(payload[0], payload[1])
+
+
+def _eval_in_process(expr: str, safe_globals: dict, conn):
+    """Evaluate ``expr`` in this (child) process and report over ``conn``.
+
+    Only plain-data outcomes leave the process; see the module comment above.
+    """
+    try:
+        result = eval(compile(ast.parse(expr, mode='eval'), "<string>", "eval"), safe_globals)
+    except BaseException as exc:
+        _send_error(conn, exc)
+        return
+
+    try:
+        kind, payload = _encode_result(result)
+    except BaseException as exc:
+        _send_error(conn, exc)
+        return
+
+    try:
+        conn.send((kind, payload, None, None, None))
+    except OSError:
+        pass  # parent went away (timeout) - nothing left to report to
+
+
+def _send_error(conn, exc):
+    """Report an exception raised by the expression, without pickling it.
+
+    User-defined exception types are not reconstructed in the parent (that
+    would be a deserialization sink). Their type name is reported with a plain
+    ``RuntimeError`` instead, which keeps ``except RuntimeError`` working
+    without letting attacker-controlled code run in the parent.
+    """
+    try:
+        if _is_stdlib_error_type(type(exc)):
+            attrs = []
+            for attr in _ERROR_ATTRS:
+                if attr in getattr(exc, '__dict__', {}):
+                    attrs.append((attr, str(getattr(exc, attr))))
+            conn.send(('error', None, type(exc).__name__,
+                       str(exc), tuple(attrs)))
+        else:
+            conn.send(('error', None, 'RuntimeError',
+                       f'Evaluation failed with {type(exc).__name__}: {exc}', ()))
+    except BaseException:
         try:
-            queue.close()
-            queue.join_thread()
-        except Exception:
+            conn.send(('error', None, 'RuntimeError',
+                       'The evaluation failed with an exception that could not be reported.', ()))
+        except BaseException:
             pass
 
-def _check_ast(parsed_expr, allowed_function_calls, allow_attributes):
+
+# Method names that interpret their string arguments as format templates.
+# ``'{0.__class__}'.format(obj)`` never produces an ast.Attribute node for
+# ``__class__`` - the traversal happens inside str.format - so these names are
+# treated as attribute access for the purposes of the dunder/attribute policy.
+_FORMAT_METHODS = frozenset({'format', 'format_map'})
+
+# Keywords whose value is invoked by the callee. A function passed as a sort
+# key or a default factory is called even though it is never the target of a
+# Call node, so the same "is this callable allowed?" policy applies to them.
+_CALLBACK_KEYWORDS = frozenset({'key', 'default_factory'})
+
+# Builtins that invoke a callable argument. ``sorted(x, key=f)`` and
+# ``iter(f, None)`` never spell a call to ``f``, but they do call it, so a
+# callable passed to any of these is subject to the call policy too.
+_CALLABLE_ACCEPTING_BUILTINS = frozenset({'sorted', 'iter', 'map', 'filter', 'min', 'max'})
+
+# Names that are never resolvable from an expression. ``__builtins__`` exposes
+# the whole (restricted) builtins mapping, which is unnecessary surface even
+# though the mapping itself is already filtered.
+_DENIED_NAMES = frozenset({'__builtins__', '__import__', 'eval', 'exec', 'compile',
+                           'globals', 'locals', 'vars', 'dir', 'getattr', 'setattr',
+                           'delattr', 'input', 'breakpoint', 'memoryview', 'open'})
+
+
+def _FORMAT_STRING_HAS_DUNDER(template: str) -> bool:
+    """True if a str.format template names a dunder attribute at all."""
+    return re.search(r'(?<![\w])__[A-Za-z0-9_]*__', template) is not None
+
+
+def _FORMAT_STRING_TRAVERSES_ATTRIBUTES(template: str) -> bool:
+    """True if a str.format template reaches inside an object.
+
+    ``format``/``format_map`` look up attribute names and mapping keys named in
+    a replacement field - ``'{0.__class__}'.format(obj)`` reads ``__class__``
+    without ever producing an ``ast.Attribute`` node, and ``'{0[secret]}'``
+    reads a mapping key. Both are access paths the AST never sees, so any field
+    that is more than a plain positional/named reference is rejected. Nested
+    fields in a format spec (``{0:{1}}``) are unwrapped and checked too.
+    """
+    probe = template
+    for _ in range(4):  # unwrap nested replacement fields a few levels deep
+        found = False
+        for match in re.finditer(r'\{([^{}]*)\}', probe):
+            field = match.group(1)
+            if not field or field.startswith(('!', ':')):
+                continue  # automatic field, e.g. "{}", "{!r}" or "{:>10}"
+            name = re.split(r'[!:\[.]', field, maxsplit=1)[0]
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*|\d+', name):
+                found = True
+                break
+            rest = re.split(r'[!:]', field[len(name):], maxsplit=1)[0]
+            if rest:
+                # Something other than a conversion/format spec follows the
+                # field name: ".attr" or "[key]" - an access we cannot see.
+                found = True
+                break
+        if found:
+            return True
+        # Re-scan the inside of nested spec fields (e.g. {0:{1.__class__}}).
+        inner = ''.join(m.group(1) for m in re.finditer(r'\{([^{}]*)\}', probe))
+        if '{' not in inner and '}' not in inner:
+            break
+        probe = probe.replace('{{', '{').replace('}}', '}')
+    return False
+
+
+def _check_ast(parsed_expr, allowed_function_calls, allow_attributes,
+               allowed_builtins=None, allowed_vars=None):
     """
     Check the AST for unsafe operations such as imports and function calls.
 
@@ -219,47 +638,178 @@ def _check_ast(parsed_expr, allowed_function_calls, allow_attributes):
         parsed_expr (ast.AST): The parsed AST expression.
         allowed_function_calls (list): A list of allowed function calls.
         allow_attributes (bool): Whether to allow attribute access.
+        allowed_builtins (dict, optional): Names supplied as builtins.
+        allowed_vars (dict, optional): Names supplied as variables.
 
     Raises:
         UnsafeExpressionError: If unsafe operations are detected in the expression.
+
+    The checks are structural rather than name-by-name:
+
+    * Every ``ast.Call`` target must be a plain ``ast.Name`` that is either a
+      safe builtin or explicitly allowed, or (with ``allow_attributes=True``) a
+      non-dunder attribute. Calls through subscripts, lambdas and other
+      indirections are rejected.
+    * A name that the expression itself rebinds (``(len := f)()``, ``[f() for
+      len in [..]]``, ``(lambda len: len())(f)``) no longer refers to the safe
+      builtin, so it may only be *called* if it is explicitly allowed.
+    * Callable values handed to builtins that invoke them (``sorted(key=...)``,
+      ``iter(f, None)``, ``map``/``filter``) follow the same policy.
+    * All attribute names starting with ``__`` are rejected, and
+      ``format``/``format_map`` templates that name attributes or keys are
+      rejected: they walk into objects without producing ``ast.Attribute``.
+    * The names in ``_DENIED_NAMES`` (``__builtins__``, ``eval``, ``exec``,
+      ``compile``, ``__import__``, ...) are never resolvable.
     """
-    # Attributes whose names start with '__' (dunders) are always blocked,
-    # whether or not allow_attributes is enabled. A fixed name list is not
-    # enough: dunders can be reached indirectly through string arguments such
-    # as obj.__getattribute__('__class__'), which the AST checker never sees.
+    allowed_function_calls = set(allowed_function_calls or ())
+    allowed_builtins = allowed_builtins or {}
+    allowed_vars = allowed_vars or {}
+    # Only these names may reach a callable. allowed_vars entries are data
+    # (values may still be callables, which is why passing one somewhere that
+    # invokes it is gated on the explicit allowlist); allowed_builtins are
+    # exposed names but are not call targets unless also allowlisted.
+    callable_names = set(allowed_function_calls) | set(allowed_builtins)
+    allowed_names = set(allowed_function_calls) | set(allowed_builtins) | set(allowed_vars)
+
+    # ---- scope analysis -------------------------------------------------
+    # Collect every name the expression binds. A comprehension target or a
+    # lambda parameter shadows the surrounding scope, so a rebound safe-builtin
+    # name is treated as caller data: it may only be called when explicitly
+    # allowlisted. This is deliberately conservative across sub-scopes.
+    rebound = set()
+    for node in ast.walk(parsed_expr):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            rebound.add(node.id)
+
+    def _callable_allowed_name(name):
+        if name in _DENIED_NAMES:
+            return False
+        if name in rebound:
+            return name in callable_names  # caller-supplied value
+        if name in _SAFE_BUILTIN_NAMES or name in callable_names:
+            return True
+        # Builtin exception/type names are safe callables too (map(str, ...)).
+        builtin = getattr(builtins, name, None)
+        return isinstance(builtin, type) and builtin.__module__ == 'builtins'
+
+    def _callable_allowed_expr(expr):
+        if isinstance(expr, ast.Name):
+            return _callable_allowed_name(expr.id)
+        if isinstance(expr, ast.Attribute):
+            return allow_attributes and not expr.attr.startswith('__')
+        return False
+
     for node in ast.walk(parsed_expr):
         # Imports are never allowed in expressions.
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             raise UnsafeExpressionError("Imports are not allowed in expressions.")
 
-        # Prevent ALL function calls except for whitelisted ones
-        # This includes calls via ast.Name (e.g., exec()), ast.Attribute (e.g., obj.method()),
-        # ast.Subscript (e.g., __builtins__['exec']()), and any other call target
-        if isinstance(node, ast.Call):
-            # Only allow calls where the function is a simple Name that's in the allowlist
-            # OR a safe builtin function
-            if isinstance(node.func, ast.Name):
-                if node.func.id in allowed_function_calls or node.func.id in _SAFE_BUILTIN_NAMES:
-                    continue  # This call is allowed
-            # Also allow method calls on objects when attributes are allowed
-            # (e.g., 'hello'.upper()) - these are ast.Attribute calls.
-            # Dunder method calls are rejected below by the Attribute check.
-            if isinstance(node.func, ast.Attribute) and allow_attributes:
-                if node.func.attr.startswith('__'):
-                    raise UnsafeExpressionError(f"Access to dunder attribute '{node.func.attr}' is not allowed.")
-                continue  # Method call is allowed
-            # All other calls are rejected (including subscript, attribute without allow_attributes, lambda, etc.)
-            raise UnsafeExpressionError("Function call is not allowed.")
+        # Names: reserved names are never resolvable, whatever the context.
+        if isinstance(node, ast.Name) and node.id in _DENIED_NAMES:
+            raise UnsafeExpressionError(
+                f"Use of the reserved name '{node.id}' is not allowed.")
 
-        # Prevent attribute access entirely unless explicitly allowed,
-        # and always block dunder attributes (e.g., __class__, __globals__,
-        # __mro__, __dict__, __getattribute__) since they are the backbone of
-        # every known sandbox escape.
+        # Attribute access is off unless explicitly enabled, and dunder names
+        # (__class__, __globals__, __mro__, __dict__, __getattribute__, ...)
+        # are always blocked - they are the backbone of every sandbox escape.
         if isinstance(node, ast.Attribute):
             if node.attr.startswith('__'):
-                raise UnsafeExpressionError(f"Access to dunder attribute '{node.attr}' is not allowed.")
+                raise UnsafeExpressionError(
+                    f"Access to dunder attribute '{node.attr}' is not allowed.")
             if not allow_attributes:
                 raise UnsafeExpressionError("Attribute access is disabled.")
+
+        if not isinstance(node, ast.Call):
+            continue
+
+        _check_call(node, allowed_function_calls, allowed_names, callable_names,
+                    rebound, allow_attributes, _callable_allowed_name, _callable_allowed_expr)
+
+
+def _check_call(node, allowed_function_calls, allowed_names, callable_names,
+                rebound, allow_attributes, callable_allowed_name, callable_allowed_expr):
+    """Validate a single ``ast.Call`` node."""
+    func = node.func
+
+    # A literal string equal to a reserved name (e.g. eval('...'),  the module
+    # name argument of __import__) is never needed. Format templates are
+    # validated as templates instead - they may legitimately contain words
+    # such as "open" or "format".
+    is_format_call = (
+        (isinstance(func, ast.Attribute) and func.attr in _FORMAT_METHODS)
+        or (isinstance(func, ast.Name) and func.id in _FORMAT_METHODS)
+    )
+    if not is_format_call:
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and arg.value in _DENIED_NAMES:
+                raise UnsafeExpressionError(
+                    f"Use of the reserved name '{arg.value}' is not allowed.")
+
+    # The call target must be a safe name or an explicitly allowed one.
+    if isinstance(func, ast.Name):
+        if func.id in _DENIED_NAMES:
+            raise UnsafeExpressionError(f"Call to '{func.id}' is not allowed.")
+        if func.id in rebound and func.id not in callable_names:
+            raise UnsafeExpressionError(
+                f"Call through the rebound name '{func.id}' is not allowed. "
+                "The expression reassigns this name, so it no longer refers to "
+                "the safe builtin; allowlist it explicitly if that is intended.")
+        if func.id not in allowed_function_calls and func.id not in _SAFE_BUILTIN_NAMES:
+            if func.id not in rebound:  # a rebound name was handled above
+                raise UnsafeExpressionError("Function call is not allowed.")
+    elif isinstance(func, ast.Attribute) and allow_attributes:
+        if func.attr.startswith('__'):
+            raise UnsafeExpressionError(
+                f"Access to dunder attribute '{func.attr}' is not allowed.")
+    else:
+        # Calls through subscripts, lambdas, calls, etc. are rejected.
+        raise UnsafeExpressionError("Function call is not allowed.")
+
+    # Format templates can traverse attributes and mapping keys, which never
+    # appear as AST nodes. Reject templates that do; require attributes to be
+    # enabled for formatting at all, since that is what templates exercise.
+    if is_format_call:
+        if not allow_attributes:
+            raise UnsafeExpressionError(
+                "Format strings can traverse attributes, so str.format/format_map "
+                "require allow_attributes=True.")
+        templates = []
+        if isinstance(func, ast.Attribute):
+            templates.append(func.value)
+        templates.extend(node.args)
+        for tmpl in templates:
+            if not (isinstance(tmpl, ast.Constant) and isinstance(tmpl.value, str)):
+                if isinstance(tmpl, ast.Name) and tmpl.id in ('str', 'format'):
+                    continue
+                if isinstance(func, ast.Attribute) and func.value is tmpl:
+                    raise UnsafeExpressionError(
+                        "Formatting requires a literal format string.")
+                continue
+            if _FORMAT_STRING_TRAVERSES_ATTRIBUTES(tmpl.value):
+                raise UnsafeExpressionError(
+                    "Attribute traversal inside a format string is not allowed.")
+            if _FORMAT_STRING_HAS_DUNDER(tmpl.value):
+                raise UnsafeExpressionError(
+                    "Dunder attribute names inside a format string are not allowed.")
+        return
+
+    # Callables passed as values to builtins that invoke them.
+    if isinstance(func, ast.Name) and func.id in _CALLABLE_ACCEPTING_BUILTINS:
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            if callable_allowed_expr(arg):
+                continue
+            if isinstance(arg, (ast.Constant, ast.List, ast.Tuple, ast.Dict,
+                                ast.Set, ast.JoinedStr)):
+                continue  # a literal/container, not a live callable
+            raise UnsafeExpressionError(
+                "Passing a non-allowed callable to a builtin that invokes it "
+                "is not allowed.")
+    for kw in node.keywords:
+        if kw.arg in _CALLBACK_KEYWORDS and not callable_allowed_expr(kw.value):
+            if not isinstance(kw.value, ast.Constant):
+                raise UnsafeExpressionError(
+                    f"Passing a non-allowed callable as '{kw.arg}' is not allowed.")
+
 
 # ---------------------------------------------------------------------------
 # Encryption

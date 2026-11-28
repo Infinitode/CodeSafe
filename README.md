@@ -23,8 +23,22 @@ An open-source Python library for code encryption, decryption, and safe evaluati
 | :--- | :--- | :--- | :--- |
 | `safe_eval` sandbox escape via indirect subscript call | CVE-2026-133467 · [GHSA-7gp8-3j6q-v4h8](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) | 0.0.1 - 0.0.4 | 0.0.5 |
 | `safe_eval` sandbox escape via dunder attribute access with `allow_attributes=True` (string-argument indirection, e.g. `().__getattribute__('__class__')`) | [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) · CVE pending | 0.0.3 - 0.0.5 | **0.0.6** |
+| Remote code execution in the calling process via unsafe deserialization of the `safe_eval()` result (cloudpickle) | GHSA to be assigned · CVE pending | 0.0.6 | **0.0.7** |
 
 You can browse all advisories at https://github.com/Infinitode/CodeSafe/security/advisories
+
+### Remote code execution in the caller via result deserialization (fixed in v0.0.7)
+
+**Version 0.0.6 deserialized the result of `safe_eval()` in the calling process with `cloudpickle.loads()` - outside the sandbox it had just enforced.**
+
+- **Vulnerability**: The AST checker only guarded what ran inside the evaluation subprocess. The child serialized whatever the expression produced with `cloudpickle.dumps()`, and the parent called `cloudpickle.loads()` on it with full builtins. An expression could return an object whose `__reduce__` chain ran arbitrary code *the moment the parent unpickled it* - the injected code executed in the caller's process, not the sandbox, and the default configuration was enough.
+- **Impact**: An attacker who controls only the expression passed to `safe_eval()` obtained arbitrary code execution in the host application, with the host's privileges (CVSS 3.1: 9.8, `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`). This is a distinct root cause from CVE-2026-133467: the sandbox itself worked; the boundary back to the caller did not.
+- **Affected versions**: 0.0.6 (0.0.1-0.0.5 were not affected by this specific issue, since they returned results through `multiprocessing.Queue` without a parent-side `cloudpickle.loads()`; they were affected by the earlier advisories instead)
+- **Fixed in**: Version **0.0.7**. The result boundary no longer involves pickle at all: the child encodes only plain data (see below) and the parent reconstructs it from primitives. A returned value has no code path into the caller.
+- **Workaround for 0.0.6**: none that is complete - treat every expression as fully trusted, or upgrade.
+- **Related hardening in the same release**: `str.format`/`format_map` templates that name attributes or keys (`'{0.__class__}'.format(obj)`) are rejected; rebinding a safe-builtin name (`(len := f)()`, `[f() for len in [..]]`, `(lambda len: len())(f)`) no longer lets an expression call a non-allowlisted callable; callables passed to builtins that invoke them (`sorted(key=...)`, `iter(f, None)`) follow the same allowlist; `__builtins__` is not reachable by name; `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` raised by an expression arrive as a catchable `RuntimeError` instead of killing or unwinding the caller; and `file_access=False` can no longer be bypassed by re-introducing `open` through `allowed_builtins`.
+
+**What `safe_eval()` returns in 0.0.7.** Results are restricted to plain data: `None`, `bool`, `int`, `float`, `complex`, `str`, `bytes`, `decimal.Decimal`, `fractions.Fraction`. Containers of plain data (`list`, `tuple`, `dict`, `set`) are returned only when `allow_objects=True` is passed. Lambdas, classes, instances of user-defined types, modules and generators are no longer returned - they raise a clear `RuntimeError` instead of being serialized. If your code relied on returning lambdas or dynamic classes, restructure the expression to return data.
 
 ### Second sandbox-escape issue fixed in v0.0.6
 
@@ -64,11 +78,11 @@ A huge thanks to [@hkmj19](https://github.com/hkmj19)/[Linkedin](https://www.lin
 > [!NOTE]
 > These tests are only available on GitHub, and not on PyPI. They are external tests that aren't built along with `CodeSafe` versions.
 
-CodeSafe v0.0.6 includes a rigorous test suite (`TestVulnerabilityFixes`, `TestEdgeCases` and `TestHardeningRegression` in `test_poc_vulnerability.py`, plus `test.py`) to systematically verify that `safe_eval` blocks sandbox escapes while preserving standard evaluation features.
+CodeSafe v0.0.7 includes a rigorous test suite (`TestVulnerabilityFixes`, `TestEdgeCases`, `TestHardeningRegression` and `TestResultBoundaryV007` in `test_poc_vulnerability.py`, plus `test.py`) to systematically verify that `safe_eval` blocks sandbox escapes while preserving standard evaluation features.
 
 ### Test Results Summary
 
-**79/79 Tests Passing** (`100% Pass Rate` across all vector categories)
+**108/108 Tests Passing** (`100% Pass Rate` across all vector categories)
 
 | Attack Vector / Category | Specific Vectors Tested | Status |
 | :--- | :--- | :--- |
@@ -79,7 +93,11 @@ CodeSafe v0.0.6 includes a rigorous test suite (`TestVulnerabilityFixes`, `TestE
 | **Module & I/O Execution** | Direct/from `import`, `os.system`, `subprocess`, `io.open`, `socket`, `requests`, `urllib`, `pathlib` write operations | **[PASS] Blocked** |
 | **Dangerous Built-ins** | `exec()`, `eval()`, `compile()`, `input()`, `open()` (default settings), modifying `__builtins__`, `dir()`, `id()` | **[PASS] Blocked** |
 | **Resource & Process Safety** | Timeout always terminates the child process (no leaked runaway processes); non-positive timeouts rejected | **[PASS] Enforced** |
-| **Error Handling** | Unserializable results (e.g. generators) raise a clear `RuntimeError`; lambdas and dynamic classes round-trip via cloudpickle; child exceptions propagate with their original type; `queue.empty()` race eliminated | **[PASS] Working** |
+| **Result Deserialization** (v0.0.7) | `__reduce__` gadgets returned as the result, in a list/tuple/dict/set, or via `allowed_vars`; lambdas, classes, modules, functions and user types as results | **[PASS] Blocked** |
+| **Format-String Traversal** (v0.0.7) | `'{0.__class__}'.format(o)`, `format_map`, nested spec fields, mapping-key access (`'{0[k]}'`) | **[PASS] Blocked** |
+| **Name Shadowing** (v0.0.7) | `(len := f)()`, `[f() for len in [..]]`, `(lambda len: len())(f)`, callables in `sorted(key=...)` / `iter(f, None)` | **[PASS] Blocked** |
+| **Reserved Names & Flags** (v0.0.7) | `__builtins__` read/rebind, `open` re-introduced via `allowed_builtins`, `SystemExit`/`KeyboardInterrupt` from an expression | **[PASS] Blocked** |
+| **Error Handling** | Plain-data results round-trip losslessly (`Decimal`/`Fraction` included); unserializable results (lambdas, classes, generators, modules) raise a clear `RuntimeError`; builtin exceptions propagate with their original type; user-defined exception types arrive as `RuntimeError`; no `Queue` race | **[PASS] Working** |
 | **Functional Baseline** | Safe arithmetic, string/list/dict operations, standard safe builtins (`len`, `max`, `abs`), explicitly allowed functions | **[PASS] Working** |
 
 ### Running the Tests
@@ -96,20 +114,35 @@ To run everything (including the functional suite in `test.py`):
 python -m unittest test.py test_poc_vulnerability.py -v
 ```
 
+### Changelog v0.0.7:
+
+* **Security Fix (critical)**: `safe_eval()` no longer deserializes the evaluation result with `cloudpickle` in the calling process. In 0.0.6 the child serialized its result and the parent called `cloudpickle.loads()` on it with full builtins, so an expression could return a `__reduce__` gadget that ran arbitrary code in the *caller* - outside the sandbox that had just been enforced. The result now crosses the process boundary as plain primitives and is rebuilt with a non-executable decoder. See the [Security Advisory](#security-advisory) above.
+* **Changed**: `safe_eval()` returns plain data only - `None`, `bool`, `int`, `float`, `complex`, `str`, `bytes`, `Decimal`, `Fraction`. Containers of plain data are opt-in via the new `allow_objects=True` parameter. Lambdas, dynamic classes, instances of user-defined types, modules and generators raise a clear `RuntimeError` instead of being pickled. **This removes a feature that 0.0.6 advertised**; it was also the attack surface.
+* **Security Fix**: `str.format`/`format_map` templates that traverse attributes or mapping keys (`'{0.__class__}'.format(obj)`, `'{0[key]}'.format(obj)`) are rejected. They read attributes without ever producing an `ast.Attribute` node for the checker to inspect.
+* **Security Fix**: An expression can no longer rebind a safe-builtin *name* and then call it - `(len := host_callable)()`, `[host_callable() for len in [..]]` and `(lambda len: len())(host_callable)` previously reached a caller-supplied callable that was not on `allowed_function_calls`. Such calls now require explicit allowlisting.
+* **Security Fix**: Callables passed to builtins that invoke them (`sorted(key=...)`, `iter(f, None)`) follow the same allowlist as direct calls. `allowed_vars` entries are data, not implicit call permissions.
+* **Security Fix**: `__builtins__` is no longer reachable by name from an expression, and can no longer be rebound or mutated.
+* **Security Fix**: An expression raising `SystemExit`, `KeyboardInterrupt` or `GeneratorExit` no longer terminates or unwinds the calling process; it arrives as a catchable `RuntimeError`. Exceptions of user-defined types are reported the same way instead of being reconstructed in the parent.
+* **Security Fix**: `file_access=False` and `network_access=False` are enforced *after* `allowed_builtins` is merged, so passing `open` (or similar) through `allowed_builtins` no longer bypasses the flag.
+* **Security**: Returned data is bounded (nesting depth 100, 1M nodes, 1 MiB of `str`/`bytes`), and int-to-str conversion is capped for the duration of a call so a returned giant integer cannot burn CPU in the caller.
+* **Changed**: The result transport is a `multiprocessing.Pipe` drained by a reader thread instead of a `Queue`. A result larger than the OS pipe buffer can no longer deadlock the parent, and the timing of `EvaluationTimeoutError` is tighter.
+* **Changed**: The `cloudpickle` dependency was removed - CodeSafe no longer imports pickle on the evaluation path at all.
+* Added regression tests for every item above (see [Vulnerability & Security Testing](#vulnerability--security-testing-test_poc_vulnerabilitypy)).
+
 ### Changelog v0.0.6:
 
 * **Security Fix**: With `allow_attributes=True`, *all* attribute names starting with `__` are now rejected (previously only a cherry-picked list of dunders, which was bypassable via string arguments, e.g. `().__getattribute__('__class__')`). See the [Security Advisory](#security-advisory) above.
 * **Security**: Timed-out evaluations always terminate the child process. Previously `immediate_termination=False` leaked an unkillable, CPU-spinning process; the parameter is deprecated and ignored.
 * **Changed**: `encrypt()` now uses authenticated cryptography - Fernet (AES-128-CBC + HMAC-SHA256) with a 256-bit key - instead of the Caesar/mapping obfuscation. Any Unicode source code round-trips losslessly. Keys come from the `key` argument (see the new `generate_key()`), the `CODESAFE_KEY` environment variable, or a built-in default key (public; obfuscation-grade only - supply your own key for real confidentiality). Files written by `encrypt_to_file()` now contain `# codesafe:v2:<token>`; legacy pre-0.0.6 `.encrypt` files are still fully readable and runnable via `decrypt()`, `decrypt_to_file()` and `run()`.
 * **Changed**: The Caesar `mapping` parameter was removed from `encrypt()` (passing it raises `TypeError`). It is still accepted by `decrypt()`/`decrypt_to_file()`/`run()` for decrypting legacy payloads.
-* **Changed**: Evaluation results are serialized with `cloudpickle` (returned from a subprocess), so lambdas and dynamically created classes can now be returned from `safe_eval()`. Results that cannot be serialized (e.g. generators) still raise a clear `RuntimeError` instead of a misleading `EvaluationTimeoutError`, and the `queue.empty()` race that could drop valid results is eliminated.
+* **Changed** (reverted in 0.0.7 for security reasons): Evaluation results were serialized with `cloudpickle` (returned from a subprocess), so lambdas and dynamically created classes could be returned from `safe_eval()`. Results that could not be serialized (e.g. generators) raised a clear `RuntimeError` instead of a misleading `EvaluationTimeoutError`, and the `queue.empty()` race that could drop valid results was eliminated. **This was the deserialization sink fixed in 0.0.7** - see the [Security Advisory](#security-advisory).
 * **Changed**: `restricted_imports` was removed from `safe_eval()` - it was redundant (imports are rejected in expressions regardless) and misleading.
 * **Bug Fix**: `decrypt()` validates its input and produces clear errors for corrupt/tampered payloads (wrong key, corrupted or tampered v2 data is detected by the HMAC).
 * **Bug Fix**: Non-positive `timeout` values are rejected with `ValueError`.
 * Exceptions from the evaluation child process now propagate with their original type (including `BaseException`); exception chaining (`raise ... from e`) is used throughout; decrypted code executed via `run()` gets a clean `__main__` namespace isolated from CodeSafe's module globals.
 * Removed `dir()` and `id()` from the default safe builtins (pure information leakage with no legitimate use in expressions).
 * All encryption/decryption file operations now explicitly use UTF-8.
-* The package now depends on `cryptography` and `cloudpickle` (installed automatically by pip).
+* The package depends on `cryptography` (installed automatically by pip). `cloudpickle` was a dependency in 0.0.6 only.
 * Packaging modernized: PEP 621 `pyproject.toml`; source distributions and wheels build correctly from a fresh checkout (the `{{VERSION_PLACEHOLDER}}` version made `pip install .` and `python -m build` fail). Trusted Publishing (OIDC) is used for PyPI releases - no stored API tokens - and releases carry PEP 740 provenance attestations, shown on PyPI.
 * A test workflow runs the full test suite on Python 3.8-3.12 across Linux, Windows and macOS for every push and PR.
 * Added [SECURITY.md](SECURITY.md) with instructions for reporting vulnerabilities privately. The security notes and limitations previously tracked in a separate audit file are now maintained in this README (see [Security Limitations & Notes](#security-limitations--notes)).
@@ -147,7 +180,7 @@ python -m unittest test.py test_poc_vulnerability.py -v
 
 ## Installation
 
-You can install CodeSafe using pip (it automatically installs the `cryptography` and `cloudpickle` dependencies):
+You can install CodeSafe using pip (it automatically installs the `cryptography` dependency):
 
 ```bash
 pip install codesafe
@@ -218,6 +251,24 @@ if __name__ == '__main__':
 > [!NOTE]
 > Attribute inspection is disabled when using `safe_eval`. You can read more about how to use `safe_eval` from [here](https://infinitode-docs.gitbook.io/documentation/package-documentation/codesafe-package-documentation?utm_source=gemini).
 
+#### What `safe_eval` can return
+
+Since v0.0.7 the result is plain data, transported from the evaluation subprocess as primitives and rebuilt without pickle:
+
+```python
+from codesafe import safe_eval
+
+safe_eval("2 + 2")                        # 4
+safe_eval("'hello'.upper()", allow_attributes=True)   # 'HELLO'
+safe_eval("[1, 2, 3]")                    # RuntimeError: containers are opt-in
+safe_eval("[1, 2, 3]", allow_objects=True)            # [1, 2, 3]
+safe_eval("lambda: 1")                    # RuntimeError: lambdas are not returned
+```
+
+Allowed values are `None`, `bool`, `int`, `float`, `complex`, `str`, `bytes`, `Decimal` and `Fraction`. Containers (`list`, `tuple`, `dict`, `set`) of those are returned only with `allow_objects=True`, up to 100 levels deep and 1 MiB of string/bytes data. Lambdas, classes, modules, generators and instances of user-defined types raise `RuntimeError` - nothing callable ever crosses back into your process.
+
+Names you pass in `allowed_vars` are **data**, not implicit call permissions: a function is only called from the expression when its name is in `allowed_function_calls` (or it is a safe builtin). This also applies to callables handed to builtins that invoke them, such as `sorted(xs, key=fn)`.
+
 > [!IMPORTANT]
 > Since v0.0.6, encrypted payloads are self-describing (`# codesafe:v2:<token>`) and any Unicode source code round-trips losslessly. Pre-0.0.6 `.encrypt` files (Base64 Caesar) keep working with `run()`, `decrypt()` and `decrypt_to_file()`, but they are no longer produced - and they were never cryptographically secure.
 
@@ -261,11 +312,11 @@ CodeSafe is designed for practical code protection, not absolute guarantees. Ple
 * **Encryption is only as strong as your key.** The built-in default key is public (it ships with the package), so payloads encrypted with it are protected only from casual inspection. Generate your own key with `generate_key()` and keep it secret (e.g. via the `CODESAFE_KEY` environment variable) for real confidentiality. Even then, `run()` must be able to read the key at execution time - anyone with both the encrypted file and the key can decrypt it.
 * **Encrypted code runs with the full permissions of the current process.** Encryption protects code at rest; it is not a security boundary at runtime. Only run code you trust.
 * **`safe_eval()` is not a perfect sandbox.** It relies on AST filtering plus a subprocess with a timeout, and expressions run with the privileges of the host process. `allow_attributes=True` convenience comes at increased risk (prefer the default `False`), and anything passed via `allowed_vars`/`allowed_builtins` runs as trusted code - the sandbox protects against the *expression*, not against what you hand it. For hostile input, add defense in depth (containers, seccomp, dropped privileges).
-* **Serialization boundary.** Results cross the subprocess boundary via `cloudpickle` (lambdas and dynamic classes round-trip; generators and modules cannot be serialized and raise a clear `RuntimeError`). Only deserialize results produced by CodeSafe's own child process - like any pickle-family tool, cloudpickle data must come from a trusted producer.
-* **`type` remains in the default safe builtins** (needed for `isinstance`-style patterns and `type(x)` introspection). With all dunder attributes rejected, it does not on its own yield an escape path, but it is the remaining reflection-adjacent primitive and is worth watching.
+* **Result boundary is data-only by design.** Since v0.0.7 the result of an evaluation is transported as plain primitives and rebuilt without pickle; nothing the expression produces executes in the calling process. The cost is that lambdas, dynamic classes, instances of user-defined types, modules and generators cannot be returned (they raise `RuntimeError`), and containers of plain data need `allow_objects=True`.
+* **`type` remains in the default safe builtins** (needed for `isinstance`-style patterns and `type(x)` introspection). With all dunder attributes rejected and no deserialization of results, it does not on its own yield an escape path, but it is the remaining reflection-adjacent primitive and is worth watching.
 * **Integrity of v2 payloads is enforced by HMAC**, but payloads carry no identity - a valid token only proves it was produced with the key, not *who* produced it. The legacy Caesar format (pre-0.0.6) has no integrity or authenticity at all.
 * **Custom Caesar mappings** (legacy) had a fixed 64-character-value requirement and are no longer produced by `encrypt()`; they are only honored when decrypting legacy payloads.
-* **Results must be serializable.** Lambdas and dynamic classes work; generators, modules, open file objects, frames and locks do not.
+* **Results must be plain data.** `None`, `bool`, `int`, `float`, `complex`, `str`, `bytes`, `Decimal`, `Fraction`, and - with `allow_objects=True` - `list`/`tuple`/`dict`/`set` containing those. Everything else raises `RuntimeError`.
 
 ## Contributing
 
