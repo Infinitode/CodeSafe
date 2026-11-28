@@ -2,12 +2,14 @@ import ast
 import builtins
 import contextlib
 import os
+import pickle
 import re
+import signal
 import sys
 import threading
+import time
 import multiprocessing
 import base64
-from multiprocessing import Process, Pipe
 from typing import Union, Optional, IO
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -167,11 +169,38 @@ def safe_eval(expr: str,
         )
 
 
+def _wait_for_outcome(finished, process, timeout, slice_seconds=0.05):
+    """Wait for the child's result, the child's exit, or the overall timeout.
+
+    ``Event.wait()`` has no way to observe a dying child, so waiting for the
+    whole timeout would report a crashed child as a hung one. Polling in short
+    slices returns as soon as either the result arrives or the child exits.
+    ``is_alive()`` cannot be used for this: it joins the process internally, and
+    under 'spawn' that blocks until ``start()`` has finished bootstrapping the
+    child. ``exitcode`` is a property that reflects the wait status without
+    joining, so it changes as soon as the child dies.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return finished.is_set()
+        if finished.wait(min(slice_seconds, remaining)):
+            return True
+        if process.exitcode is not None:
+            # The child is gone; the reader thread will observe EOF on the pipe
+            # and set the event, so a short grace period is enough.
+            finished.wait(0.2)
+            return finished.is_set()
+
+
 # Maximum bracket ()[]{} nesting depth accepted before parsing. Legitimate
 # expressions never approach this; the limit exists so that hostile input is
 # rejected by a cheap scan instead of crashing the C parser, whose behaviour on
 # deep nesting differs between CPython versions (3.8 raises MemoryError).
 _MAX_EXPRESSION_NESTING = 64
+
+_SIGTERM = getattr(signal, 'SIGTERM', 15)
 
 _OPENING = {"(": ")", "[": "]", "{": "}"}
 _CLOSING = {")", "]", "}"}
@@ -303,10 +332,23 @@ def _safe_eval_impl(expr, allowed_builtins, allowed_vars, timeout,
     reader = threading.Thread(target=_reader, name="codesafe-eval-reader", daemon=True)
 
     try:
-        process.start()
+        try:
+            process.start()
+        except (AttributeError, TypeError, pickle.PicklingError) as exc:
+            # Under 'spawn' the argument pickling happens here, in the caller.
+            # It fails for anything not importable by name (lambdas, local
+            # classes, some closures), and the raw error would otherwise escape
+            # as an unrelated AttributeError/TypeError.
+            raise RuntimeError(
+                "The evaluation process could not be started: an object passed "
+                "through allowed_vars or allowed_builtins could not be pickled "
+                "for the 'spawn' start method used on this platform. Pass only "
+                "module-level, importable objects there, or use a start method "
+                "that inherits objects (fork on POSIX)."
+            ) from exc
         child_conn.close()  # parent must not hold the write end open
         reader.start()
-        finished.wait(timeout)
+        _wait_for_outcome(finished, process, timeout)
 
         if not finished.is_set():
             # Give the child a brief grace period to finish, then terminate any
@@ -316,6 +358,25 @@ def _safe_eval_impl(expr, allowed_builtins, allowed_vars, timeout,
             if not finished.is_set() or process.is_alive():
                 process.terminate()
                 process.join()
+                exitcode = process.exitcode
+                # -SIGTERM is the termination we just requested, so that case is
+                # a genuine timeout; anything else non-zero means the child died
+                # by itself before it could report.
+                if exitcode is not None and exitcode not in (0, -_SIGTERM):
+                    # The child died on its own without sending a result. On
+                    # 'spawn' platforms a failure during child bootstrap (for
+                    # example an object in allowed_vars that cannot be pickled
+                    # to the child) kills the interpreter before it can report
+                    # anything. That is a crash, not a slow evaluation, and
+                    # reporting it as a timeout would be misleading.
+                    raise RuntimeError(
+                        "The evaluation process exited unexpectedly "
+                        f"(exit code {exitcode}) without returning a result. "
+                        "On platforms that start the child with 'spawn' (Windows, "
+                        "or a host that pinned that start method) objects passed "
+                        "through allowed_vars/allowed_builtins must be picklable "
+                        "and importable."
+                    )
                 raise EvaluationTimeoutError(
                     f"Evaluation exceeded the maximum execution timeout of {timeout} seconds and was terminated."
                 )
