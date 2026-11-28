@@ -45,7 +45,7 @@ Only the latest release receives fixes. Please upgrade rather than report issues
 | :--- | :--- | :--- | :--- |
 | `safe_eval` sandbox escape via indirect subscript call | CVE-2026-133467 · [GHSA-7gp8-3j6q-v4h8](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) | 0.0.1 - 0.0.4 | 0.0.5 |
 | `safe_eval` sandbox escape via dunder attribute string-argument (`allow_attributes=True`) | [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) · CVE pending | 0.0.3 - 0.0.5 | 0.0.6 |
-| Remote code execution in the calling process via unsafe deserialization of the `safe_eval()` result | GHSA to be assigned · CVE pending | 0.0.6 | 0.0.7 |
+| Remote code execution in the calling process via unsafe deserialization of the `safe_eval()` result | [GHSA-2565-87hp-2588](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-2565-87hp-2588) · CVE pending | 0.0.6 | 0.0.7 |
 
 See https://github.com/Infinitode/CodeSafe/security/advisories for the canonical list.
 

@@ -23,7 +23,7 @@ An open-source Python library for code encryption, decryption, and safe evaluati
 | :--- | :--- | :--- | :--- |
 | `safe_eval` sandbox escape via indirect subscript call | CVE-2026-133467 · [GHSA-7gp8-3j6q-v4h8](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-7gp8-3j6q-v4h8) | 0.0.1 - 0.0.4 | 0.0.5 |
 | `safe_eval` sandbox escape via dunder attribute access with `allow_attributes=True` (string-argument indirection, e.g. `().__getattribute__('__class__')`) | [GHSA-m85r-gp57-6p5q](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-m85r-gp57-6p5q) · CVE pending | 0.0.3 - 0.0.5 | **0.0.6** |
-| Remote code execution in the calling process via unsafe deserialization of the `safe_eval()` result (cloudpickle) | GHSA to be assigned · CVE pending | 0.0.6 | **0.0.7** |
+| Remote code execution in the calling process via unsafe deserialization of the `safe_eval()` result (cloudpickle) | [GHSA-2565-87hp-2588](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-2565-87hp-2588) · CVE pending | 0.0.6 | **0.0.7** |
 
 You can browse all advisories at https://github.com/Infinitode/CodeSafe/security/advisories
 
@@ -39,6 +39,8 @@ You can browse all advisories at https://github.com/Infinitode/CodeSafe/security
 - **Related hardening in the same release**: `str.format`/`format_map` templates that name attributes or keys (`'{0.__class__}'.format(obj)`) are rejected; rebinding a safe-builtin name (`(len := f)()`, `[f() for len in [..]]`, `(lambda len: len())(f)`) no longer lets an expression call a non-allowlisted callable; callables passed to builtins that invoke them (`sorted(key=...)`, `iter(f, None)`) follow the same allowlist; `__builtins__` is not reachable by name; `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` raised by an expression arrive as a catchable `RuntimeError` instead of killing or unwinding the caller; and `file_access=False` can no longer be bypassed by re-introducing `open` through `allowed_builtins`.
 
 **What `safe_eval()` returns in 0.0.7.** Results are restricted to plain data: `None`, `bool`, `int`, `float`, `complex`, `str`, `bytes`, `decimal.Decimal`, `fractions.Fraction`. Containers of plain data (`list`, `tuple`, `dict`, `set`) are returned only when `allow_objects=True` is passed. Lambdas, classes, instances of user-defined types, modules and generators are no longer returned - they raise a clear `RuntimeError` instead of being serialized. If your code relied on returning lambdas or dynamic classes, restructure the expression to return data.
+
+**Advisory**: [GHSA-2565-87hp-2588](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-2565-87hp-2588). Reported by **Juan Lucas Armendares** of **Sunplace Solutions** - thank you for finding and reporting this.
 
 ### Second sandbox-escape issue fixed in v0.0.6
 
@@ -128,6 +130,7 @@ python -m unittest test.py test_poc_vulnerability.py -v
 * **Changed**: The result transport is a `multiprocessing.Pipe` drained by a reader thread instead of a `Queue`. A result larger than the OS pipe buffer can no longer deadlock the parent, and the timing of `EvaluationTimeoutError` is tighter.
 * **Changed**: The `cloudpickle` dependency was removed - CodeSafe no longer imports pickle on the evaluation path at all.
 * Added regression tests for every item above (see [Vulnerability & Security Testing](#vulnerability--security-testing-test_poc_vulnerabilitypy)).
+* **Credit**: The critical result-deserialization issue above was reported by **Juan Lucas Armendares** of **Sunplace Solutions** - many thanks. See [GHSA-2565-87hp-2588](https://github.com/Infinitode/CodeSafe/security/advisories/GHSA-2565-87hp-2588).
 
 ### Changelog v0.0.6:
 
