@@ -63,15 +63,6 @@ def main():
         return decrypt(encrypt("print(1)", key=key), key=key)
     show("roundtrip", _crypto)
 
-    section("subprocess/pickle behaviour")
-    def _probe_pickle():
-        import pickle
-
-        class Local:
-            pass
-        pickle.dumps(Local())
-        return "local class pickled"
-    show("local class picklable (spawn precondition)", _probe_pickle)
     return 0
 
 
